@@ -1,0 +1,19 @@
+kickmix-engine
+Copyright 2026 James Barlow
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+AI authorship. All code in this repository was written by an AI model (Claude,
+by Anthropic) under the direction of the repository owner, James Barlow, who is
+responsible for it. It is openly AI-assisted and is not presented as hand-written.
+
+Derived semantics. The simulation semantics (operation set, condition stack,
+128-bit fixed-precision angles, global phase, HMR/R measurement outcomes) and the
+random-number chain (std::seed_seq -> mt19937_64 -> ChaCha8 keys, per-256-shot
+seeding) follow kickmix (distributed in Google's Qualtran project, https://github.com/quantumlib/Qualtran, directory kickmix/), Copyright Google LLC,
+licensed under the Apache License, Version 2.0. This crate is an independent Rust
+re-implementation checked for per-shot equality against kickmix; where the
+semantics were taken from kickmix source (sim/sim.h, util/chacha.h,
+util/fixed_precision_angle_128.*, py/interactive_simulator.pybind.cc) the
+attribution above applies. This project is not affiliated with or endorsed by
+Google LLC.

@@ -1,0 +1,21 @@
+[package]
+name = "kickmix-engine"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Bit-sliced CPU simulator core, per-shot compatible with kickmix (M1 trial)"
+
+[lib]
+name = "_engine"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+pyo3 = { version = "0.26", features = ["abi3-py312", "extension-module"] }
+numpy = "0.26"
+rayon = "1.10"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+debug = false
