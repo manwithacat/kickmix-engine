@@ -3,7 +3,7 @@
 All notable changes to kickmix-engine. Dates are UTC. The project was written by an AI model (Claude) under the
 owner's direction; see NOTICE.
 
-## 0.4.0 (2026-10-28, unreleased)
+## 0.4.0 (2026-10-28)
 
 ### Added
 - Run-time kernel dispatch on x86_64 (`src/kernel.rs`). The simulator loop (`Sim::run`) and the exact DQI sampler are
