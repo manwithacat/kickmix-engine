@@ -188,3 +188,32 @@ def pcg_words_from_state(st):
     s, inc = st['state']['state'], st['state']['inc']
     M = (1 << 64) - 1
     return [s & M, s >> 64, inc & M, inc >> 64, st['has_uint32'], st['uinteger']]
+
+
+def test_kernel_info():
+    """The selected kernel is one this build contains and this CPU can run; KICKMIX_ENGINE_KERNEL is honoured."""
+    info = ke.kernel_info()
+    assert info['kernel'] in info['available'] and set(info['available']) <= set(info['compiled'])
+    assert all(info['features'].get(f) for f in info['kernel_requires'] if f in info['features'])
+    req = os.environ.get('KICKMIX_ENGINE_KERNEL', '').strip().lower()
+    if req and req != 'auto':
+        assert info['kernel'] == req and info['selected_by'] == 'env'
+    else:
+        assert info['kernel'] == info['available'][-1] and info['selected_by'] == 'auto'
+
+
+def test_kernel_override_errors_for_missing_kernel(tmp_path):
+    """Requesting a kernel this machine cannot run fails clearly (in a child process: the choice is per process)."""
+    import subprocess, sys
+    info = ke.cpu_info()
+    missing = [k for k in ('baseline', 'avx2', 'avx512', 'neon') if k not in info['available']]
+    for k in missing + ['bogus']:
+        env = dict(os.environ, KICKMIX_ENGINE_KERNEL=k)
+        code = ('import numpy as np, kickmix_engine as ke\n'
+                'try:\n    ke.kernel_info()\nexcept ValueError as e:\n    print("ERR", e)\n'
+                'p = ke.compile_kmb(%r)\n'
+                'try:\n    ke.run_batches(p, [1], [], np.zeros(0, np.uint64), [], np.zeros(0, np.uint64))\n'
+                'except ValueError as e:\n    print("RUNERR", e)\n' % KMB)
+        r = subprocess.run([sys.executable, '-c', code], env=env, capture_output=True, text=True, cwd=str(tmp_path))
+        assert r.returncode == 0, r.stderr
+        assert 'ERR KICKMIX_ENGINE_KERNEL' in r.stdout and 'RUNERR KICKMIX_ENGINE_KERNEL' in r.stdout, r.stdout

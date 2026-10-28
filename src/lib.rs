@@ -2,6 +2,7 @@
 //! Written by an AI model (Claude) under the owner's direction; semantics follow kickmix (Apache-2.0, Google LLC).
 pub mod dqi_sample;
 pub mod engine;
+pub mod kernel;
 pub mod program;
 pub mod rng;
 pub mod sim;
@@ -269,6 +270,42 @@ fn engine_version() -> (&'static str, u32) {
     (env!("CARGO_PKG_VERSION"), program::CACHE_FORMAT)
 }
 
+/// CPU features and kernels, without selecting one (never fails): dict(arch, compiled, available, features,
+/// env_request, kernel_features). Used by `kickmix-engine doctor`.
+#[pyfunction]
+fn cpu_info<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+    let d = PyDict::new(py);
+    d.set_item("arch", std::env::consts::ARCH)?;
+    d.set_item("os", std::env::consts::OS)?;
+    d.set_item("compiled", kernel::compiled().iter().map(|k| k.name()).collect::<Vec<_>>())?;
+    d.set_item("available", kernel::available().iter().map(|k| k.name()).collect::<Vec<_>>())?;
+    let f = PyDict::new(py);
+    for (n, v) in kernel::detected_features() {
+        f.set_item(n, v)?;
+    }
+    d.set_item("features", f)?;
+    let kf = PyDict::new(py);
+    for k in kernel::compiled() {
+        kf.set_item(k.name(), k.features().to_vec())?;
+    }
+    d.set_item("kernel_features", kf)?;
+    d.set_item("env_var", kernel::ENV)?;
+    d.set_item("env_request", std::env::var(kernel::ENV).ok())?;
+    Ok(d)
+}
+
+/// The kernel this process uses (selected once, at first call): dict(kernel, selected_by, available, compiled,
+/// features). Raises ValueError if KICKMIX_ENGINE_KERNEL names a kernel this CPU or build cannot run.
+#[pyfunction]
+fn kernel_info<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+    let (k, how) = kernel::selected().map_err(PyValueError::new_err)?;
+    let d = cpu_info(py)?;
+    d.set_item("kernel", k.name())?;
+    d.set_item("selected_by", how)?;
+    d.set_item("kernel_requires", k.features().to_vec())?;
+    Ok(d)
+}
+
 #[pymodule]
 fn _engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyProgram>()?;
@@ -279,5 +316,7 @@ fn _engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(sample_dqi, m)?)?;
     m.add_function(wrap_pyfunction!(run_dqi, m)?)?;
     m.add_function(wrap_pyfunction!(engine_version, m)?)?;
+    m.add_function(wrap_pyfunction!(cpu_info, m)?)?;
+    m.add_function(wrap_pyfunction!(kernel_info, m)?)?;
     Ok(())
 }

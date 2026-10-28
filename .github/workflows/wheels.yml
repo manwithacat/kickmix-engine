@@ -1,6 +1,9 @@
 # Build and test abi3 wheels (Python >= 3.12) for macOS arm64 and Linux x86_64 (manylinux).
-# On every push, pull request and manual run: wheels + sdist are uploaded as workflow artifacts.
-# On a tag push (v*): the same files are also attached to a GitHub release for that tag.
+# On every push, pull request and manual run: wheels + sdist + release-manifest.json are uploaded as workflow
+# artifacts. On a tag push (v*): the same files are also attached to a GitHub release for that tag.
+# The Linux x86_64 wheel contains three simulator kernels (baseline, AVX2, AVX-512) chosen at start-up; the Linux
+# test job runs the tests once per kernel the runner's CPU supports (KICKMIX_ENGINE_KERNEL) and skips the others
+# with a notice. Test status per wheel and kernel goes into release-manifest.json (tools/make_release_manifest.py).
 name: wheels
 
 on:
@@ -89,26 +92,122 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install pytest dist/*.whl
       - name: Tests (no kickmix or competition files needed)
+        id: tests
+        if: runner.os == 'macOS'
         working-directory: ${{ runner.temp }}
         run: python -m pytest -v -rs "${{ github.workspace }}/tests" -p no:cacheprovider
+      - name: Doctor (CPU features and kernels of this runner)
+        if: runner.os == 'Linux'
+        working-directory: ${{ runner.temp }}
+        run: |
+          grep -m1 'model name' /proc/cpuinfo || true
+          kickmix-engine doctor --json
+      - name: Tests once per kernel this CPU supports (baseline, avx2, avx512; unsupported ones are skipped)
+        if: runner.os == 'Linux'
+        working-directory: ${{ runner.temp }}
+        run: >
+          python "${{ github.workspace }}/tools/ci_kernel_tests.py"
+          --tests "${{ github.workspace }}/tests"
+          --wheel "$(ls "${{ github.workspace }}"/dist/*.whl)"
+          --status "${{ runner.temp }}/status/test-status-${{ matrix.name }}-py${{ matrix.python }}.json"
+      - name: Record macOS test status
+        if: always() && runner.os == 'macOS'
+        working-directory: ${{ runner.temp }}
+        env:
+          OUTCOME: ${{ steps.tests.outcome }}
+        run: |
+          mkdir -p status
+          python - <<'PY'
+          import glob, json, os, platform
+          import kickmix_engine as k
+          ci = k.cpu_info()
+          o = 'passed' if os.environ['OUTCOME'] == 'success' else 'failed'  # skipped/cancelled count as failed
+          wheel = os.path.basename(glob.glob(os.path.join(os.environ['GITHUB_WORKSPACE'], 'dist', '*.whl'))[0])
+          rec = dict(wheel=wheel, python=platform.python_version(), runner=os.environ.get('RUNNER_NAME'),
+                     runner_os='macOS', cpu_model=platform.processor(), arch=ci['arch'], available=ci['available'],
+                     features=ci['features'], kernels={kk: dict(outcome=o) for kk in ci['compiled']})
+          json.dump(rec, open('status/test-status-${{ matrix.name }}-py${{ matrix.python }}.json', 'w'), indent=2)
+          print(json.dumps(rec, indent=2))
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-status-${{ matrix.name }}-py${{ matrix.python }}
+          path: ${{ runner.temp }}/status/*.json
+          if-no-files-found: warn
       - name: CLI smoke
         working-directory: ${{ runner.temp }}
         run: |
           kickmix-engine --help
           kickmix-engine cache info --cache-dir "${{ runner.temp }}/kme-cache"
-          python -c "import kickmix_engine as k; print(k.__version__, k.engine_version(), k.__file__)"
+          python -c "import kickmix_engine as k; print(k.__version__, k.engine_version(), k.__file__); print(k.kernel_info())"
+          kickmix-engine doctor
+
+  manifest:
+    # release-manifest.json on every run (artifact), so agents can read the same file from any CI run.
+    if: ${{ !cancelled() && needs.build.result == 'success' && needs.sdist.result == 'success' }}
+    needs: [build, sdist, test]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheel-*
+          path: dist
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: sdist
+          path: dist
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          pattern: test-status-*
+          path: status
+          merge-multiple: true
+      - name: Build release-manifest.json
+        env:
+          TEST_RESULT: ${{ needs.test.result }}
+        run: |
+          base=""
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            base="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME"
+          fi
+          python tools/make_release_manifest.py dist --status-dir status ${base:+--release-url-base "$base"}
+          echo "test job result: $TEST_RESULT"
+          cat dist/release-manifest.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-manifest
+          path: dist/release-manifest.json
+          if-no-files-found: error
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [build, sdist, test]
+    needs: [build, sdist, test, manifest]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - uses: actions/download-artifact@v4
         with:
+          pattern: wheel-*
           path: dist
           merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: sdist
+          path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-manifest
+          path: dist
+      - name: Refuse to release if any tested kernel failed
+        run: |
+          python3 -c "import json,sys; m=json.load(open('dist/release-manifest.json')); print('manifest test_status:', m['test_status']); sys.exit(0 if m['test_status']=='passed' else 1)"
       - name: Checksums
         run: cd dist && sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt
       - uses: softprops/action-gh-release@v2

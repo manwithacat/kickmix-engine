@@ -136,6 +136,7 @@ rs = [int.from_bytes(rng.bytes(32), 'little') for _ in range(3)]
 rx = rng.integers(0, 1 << 22, size=(3, a.random_batches, 1024), dtype=np.uint64); rx[:, 0, :8] = 0
 ok2, _ = compare('random_S4', rs, rx, 4, a.random_batches, results)
 total = sum(r['shots'] for k, r in results.items() if k != 'control_wrong_seed')
+results['kernel'] = ke.kernel_info()  # which simulator kernel these results are for
 results['summary'] = dict(total_compared_shots=total, parity_pass=bool(ok1 and ok2), control_mismatched=bool(not okc))
 print(results['summary'])
 json.dump(results, open(a.out, 'w'), indent=1, default=lambda o: o.item() if hasattr(o, 'item') else str(o))

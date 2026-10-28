@@ -117,6 +117,36 @@ impl DqiSampler {
     /// `sample_shots(spec, tables, default_rng(seed), 256, weight_probs)`; `rng` holds the generator state and is
     /// advanced exactly as NumPy advances it.
     pub fn sample(&self, rng: &mut Pcg64, keep_values: bool) -> DqiBatch {
+        #[cfg(target_arch = "x86_64")]
+        {
+            use crate::kernel::Kernel;
+            // SAFETY: Avx2/Avx512 are active only when the CPU has every feature these copies are compiled with.
+            match crate::kernel::active() {
+                Kernel::Avx512 => unsafe { self.sample_avx512(rng, keep_values) },
+                Kernel::Avx2 => unsafe { self.sample_avx2(rng, keep_values) },
+                _ => self.sample_impl(rng, keep_values),
+            }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        self.sample_impl(rng, keep_values)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2,bmi1,bmi2,fma,lzcnt,movbe")]
+    unsafe fn sample_avx2(&self, rng: &mut Pcg64, keep_values: bool) -> DqiBatch {
+        self.sample_impl(rng, keep_values)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2,bmi1,bmi2,fma,lzcnt,movbe,avx512f,avx512bw,avx512vl,avx512dq")]
+    unsafe fn sample_avx512(&self, rng: &mut Pcg64, keep_values: bool) -> DqiBatch {
+        self.sample_impl(rng, keep_values)
+    }
+
+    /// Kernel-independent body (integer and IEEE-754 double arithmetic only, no FMA contraction in Rust, so every
+    /// kernel copy draws the same values).
+    #[inline(always)]
+    fn sample_impl(&self, rng: &mut Pcg64, keep_values: bool) -> DqiBatch {
         const B: usize = 256;
         let (m, n, deg) = (self.m, self.n, self.degree);
         let order = ((1u64 << deg) - 1) as u64;

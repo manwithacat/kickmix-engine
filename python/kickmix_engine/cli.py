@@ -3,6 +3,7 @@
     kickmix-engine verify dqi CIRCUIT.kmb [--salt S] [--threads N] [--cross-check] ...
     kickmix-engine verify invsqrt CIRCUIT.kmb [--salt S] [--threads N] [--cross-check] ...
     kickmix-engine cache info|prune|clear [--cache-dir DIR]
+    kickmix-engine doctor [--json] [--manifest PATH_OR_URL]
 
 `verify` prints the official verifier's summary JSON (same fields, including `reaction_depth`) and exits 0 on PASS,
 1 on FAIL ({"status": "FAIL", "error": ...}), like the official CLI. The official
@@ -11,7 +12,13 @@ set KICKMIX_ENGINE_VERIFIERS to the competition's `verifiers/` directory. The ve
 be importable in this interpreter (the simulation itself does not use it).
 
 --cross-check also runs the official verifier CLI unchanged (in --official-python, default this interpreter) and
-prints {"engine": ..., "official": ..., "differences": ..., "match": bool}; exit code 3 if any field differs.
+prints {"engine": ..., "official": ..., "differences": ..., "match": bool, "engine_kernel": ...}; exit code 3 if
+any field differs.
+
+The simulator kernel (x86_64: baseline, avx2 or avx512, the best the CPU supports; aarch64: neon) is chosen once per
+process; KICKMIX_ENGINE_KERNEL=baseline|avx2|avx512 forces one (exit 2 if this CPU cannot run it). `--timing` and
+`--cross-check` report it. `doctor` reports the CPU features, kernels, versions, cache and verifier status, and with
+--manifest the matching wheel of a release (`release-manifest.json`) with its SHA-256.
 """
 from __future__ import annotations
 
@@ -91,6 +98,15 @@ def cmd_verify(a):
         print(json.dumps({'status': 'FAIL', 'error': 'official verifier not found: pass --verifier or set '
                           'KICKMIX_ENGINE_VERIFIERS'}, indent=2))
         return 1
+    from . import kernel_info
+    try:
+        kinfo = kernel_info()
+    except ValueError as ex:
+        print(json.dumps({'status': 'ERROR', 'error': str(ex)}, indent=2))
+        return 2
+    kernel = {'kernel': kinfo['kernel'], 'selected_by': kinfo['selected_by'], 'available': kinfo['available'],
+              'requires': kinfo['kernel_requires'],
+              'cpu_features': sorted(f for f, d in kinfo['features'].items() if d)}
     cache = ProgramCache(a.cache_dir, enabled=not a.no_cache)
     t0 = time.perf_counter()
     try:
@@ -99,6 +115,7 @@ def cmd_verify(a):
     except (AssertionError, ValueError, RuntimeError, OSError) as ex:
         eng, info, rc = {'status': 'FAIL', 'error': str(ex)}, {}, 1
     info['total_s'] = time.perf_counter() - t0
+    info['kernel'] = kernel
     if a.timing:
         print(json.dumps({'engine_info': info}, default=str), file=sys.stderr)
     if not a.cross_check:
@@ -117,7 +134,7 @@ def cmd_verify(a):
     for k in sorted(set(eng) | set(off)):
         if eng.get(k) != off.get(k):
             diffs[k] = {'engine': eng.get(k), 'official': off.get(k)}
-    res = {'match': not diffs, 'differences': diffs, 'engine': eng, 'official': off,
+    res = {'match': not diffs, 'differences': diffs, 'engine': eng, 'official': off, 'engine_kernel': kernel,
            'official_command': cmd, 'official_returncode': p.returncode,
            'seconds': {'engine': round(info['total_s'], 3), 'official': round(t_off, 3)}}
     print(json.dumps(res, indent=2, default=str))
@@ -169,7 +186,13 @@ def main(argv=None):
     c = sub.add_parser('cache', help='inspect or clear the program cache')
     c.add_argument('action', choices=('info', 'prune', 'clear'))
     c.add_argument('--cache-dir', default=None)
+    d = sub.add_parser('doctor', help='report CPU features, kernels, versions, cache and verifier status')
+    d.add_argument('--json', action='store_true', help='one JSON object (for agents and automation)')
+    d.add_argument('--manifest', default=None, help='release-manifest.json (path or URL): name the matching wheel')
     a = ap.parse_args(argv)
+    if a.cmd == 'doctor':
+        from .doctor import main as doctor_main
+        return doctor_main(a)
     return cmd_verify(a) if a.cmd == 'verify' else cmd_cache(a)
 
 

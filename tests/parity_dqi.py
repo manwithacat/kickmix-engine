@@ -235,6 +235,7 @@ for path in a.kmb:
     print('controls', R['controls'], flush=True)
     R['seconds'] = round(time.time() - t0, 1)
     del circuit
+results['kernel'] = ke.kernel_info()  # which simulator kernel these results are for
 results['summary'] = dict(
     parity_pass=bool(all_ok), controls_mismatched=bool(controls_ok),
     verifier_chunks={k: sum(1 for r in c['chunks'] if r['salt'] is not None) for k, c in results['circuits'].items()},

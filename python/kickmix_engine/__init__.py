@@ -11,6 +11,23 @@ from ._engine import Program, derive_keys, engine_version, kind_names, run as _r
 
 __version__ = engine_version()[0]
 
+
+def kernel_info() -> dict:
+    """The simulator kernel this process uses and why, plus the detected CPU features.
+
+    Keys: kernel ('baseline' | 'avx2' | 'avx512' on x86_64, 'neon' on aarch64), selected_by ('auto' = best the CPU
+    supports, 'env' = KICKMIX_ENGINE_KERNEL), kernel_requires, compiled (kernels in this build), available (those
+    this CPU can run), features {name: detected}, kernel_features {kernel: [features]}, arch, os, env_var,
+    env_request. The choice is made once per process. Raises ValueError if KICKMIX_ENGINE_KERNEL names a kernel
+    this CPU or build cannot run (every simulation call raises the same error).
+    """
+    return dict(_engine.kernel_info())
+
+
+def cpu_info() -> dict:
+    """Like `kernel_info()` but without selecting a kernel, so it never raises (used by `kickmix-engine doctor`)."""
+    return dict(_engine.cpu_info())
+
 KINDS = list(kind_names())
 TOFFOLI_KINDS = ("CCX", "CCZ", "CSWAP")
 

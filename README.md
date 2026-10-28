@@ -21,14 +21,17 @@ Requirements: Python 3.12 or later on macOS arm64 or Linux x86_64. NumPy is inst
 
 ```sh
 # Wheels are attached to each GitHub release (abi3: one wheel per platform serves every Python >= 3.12).
-pip install https://github.com/manwithacat/kickmix-engine/releases/download/v0.3.0/kickmix_engine-0.3.0-cp312-abi3-macosx_11_0_arm64.whl
-pip install https://github.com/manwithacat/kickmix-engine/releases/download/v0.3.0/kickmix_engine-0.3.0-cp312-abi3-manylinux_2_28_x86_64.whl
+pip install https://github.com/manwithacat/kickmix-engine/releases/download/v0.4.0/kickmix_engine-0.4.0-cp312-abi3-macosx_11_0_arm64.whl
+pip install https://github.com/manwithacat/kickmix-engine/releases/download/v0.4.0/kickmix_engine-0.4.0-cp312-abi3-manylinux_2_28_x86_64.whl
 
 # kickmix must also be importable: the official verifier modules import it, even though the engine never uses it to simulate.
 pip install kickmix   # kickmix 1.0.0 from PyPI, or the faster fork below
 ```
 
-Each release has a `SHA256SUMS.txt`. For kickmix you can use the PyPI package (the official build) or the
+Each release has a `SHA256SUMS.txt` and a machine-readable `release-manifest.json` (see
+[For agents and automation](#for-agents-and-automation)). The Linux x86_64 wheel contains three simulator kernels
+(baseline, AVX2, AVX-512) and picks the best one for the CPU at start-up; there is no separate AVX wheel to choose.
+For kickmix you can use the PyPI package (the official build) or the
 [kickmix-macos](https://github.com/manwithacat/kickmix-macos) fork, an openly AI-assisted fork by the same owner. The
 benchmarks below compare against both.
 
@@ -73,6 +76,7 @@ summary = DQITask("4ee7a17b4cbc.kmb").verify(salt="", threads=8)   # the officia
 ```
 kickmix-engine verify {dqi,invsqrt} CIRCUIT.kmb [--salt S] [--seed N] [--threads N] [--cross-check] [options]
 kickmix-engine cache {info,prune,clear} [--cache-dir DIR]
+kickmix-engine doctor [--json] [--manifest PATH_OR_URL]
 python -m kickmix_engine ...    # same thing
 ```
 
@@ -94,7 +98,52 @@ python -m kickmix_engine ...    # same thing
 - Compiled programs are cached on disk, keyed by the SHA-256 of the circuit file and the engine build. The cache lives
   in `--cache-dir`, `$KICKMIX_ENGINE_CACHE`, `$XDG_CACHE_HOME/kickmix-engine` or `~/.cache/kickmix-engine`, and
   `--no-cache` turns it off. A DQI program takes about 257 MiB. `cache prune` removes entries written by other builds.
-- `--timing` prints engine timings and cache events to stderr.
+- `--timing` prints engine timings, cache events and the simulator kernel (`kernel`, how it was selected, the CPU
+  features detected) to stderr. `--cross-check` output also carries `engine_kernel`. The summary itself has only the
+  official verifier's fields, so it stays comparable.
+- Exit code 2 (with `{"status": "ERROR", ...}`) when `KICKMIX_ENGINE_KERNEL` names a kernel this CPU cannot run.
+
+## Kernels (x86_64)
+
+The simulator loop and the DQI sampler are compiled three times into the x86_64 build: **baseline** (any x86-64
+CPU), **avx2** (the x86-64-v3 set: `avx2 bmi1 bmi2 fma lzcnt movbe`) and **avx512** (v3 plus
+`avx512f avx512bw avx512vl avx512dq`). Each copy is the same Rust source compiled with different target features, so
+all three must give the same results bit for bit. At the first simulation call the engine picks the best kernel the
+CPU supports (`is_x86_feature_detected!`). To force one, for testing or benchmarking:
+
+```sh
+KICKMIX_ENGINE_KERNEL=baseline kickmix-engine verify dqi c.kmb --timing   # or avx2, avx512; auto = default
+```
+
+The choice is made once per process. A kernel the CPU lacks is an error, not a silent fallback. On aarch64 (Apple
+Silicon) there is a single kernel, reported as `neon`. From Python, `kickmix_engine.kernel_info()` returns the
+selected kernel and the detected features, and `kickmix_engine.cpu_info()` returns the same information without
+selecting a kernel. The parity scripts (`tests/parity.py`, `tests/parity_dqi.py`) record the kernel in their JSON
+output. CI runs the tests once per kernel that the Linux runner supports.
+
+## For agents and automation
+
+Two machine-readable entry points let a program pick and check the right artefact without guessing:
+
+- **`release-manifest.json`**, attached to every GitHub release and uploaded as the `release-manifest` artifact of
+  every CI run (schema `kickmix-engine-release-manifest/1`). It lists `engine_version`, `git_commit`, `git_ref`,
+  `ci_run_id`, `ci_run_url`, an overall `test_status` (`passed`, `failed` or `incomplete`) and `parity_evidence`.
+  For every wheel it gives `filename`, `python_tag`, `abi_tag`, `platform_tag`, `os`, `arch`, `sha256`, `size`,
+  `url` (releases only), `kernels` (each with the CPU features it `requires`) and `test_status.per_kernel`
+  (`passed`, `failed`, `skipped: <reason>` or `not run on CI`), plus the sdist. It is built by
+  `tools/make_release_manifest.py DIST_DIR --status-dir STATUS_DIR`, which takes the kernel feature lists from
+  `src/kernel.rs` and the per-kernel test outcomes from the CI test jobs (`tools/ci_kernel_tests.py`).
+- **`kickmix-engine doctor --json [--manifest PATH_OR_URL]`** (schema `kickmix-engine-doctor/1`) reports `platform`,
+  `python`, `cpu.features`, `kernels` (`compiled`, `available`, `selected`, `selected_by`, `requires`, `error`),
+  `engine` (version, cache format, extension path and SHA-256), `cache`, `kickmix` (importable, version) and
+  `verifiers` (path, SHA-256, importable) for DQI and invsqrt. With `--manifest` it adds `manifest.match`, the wheel
+  in that release that fits this interpreter and platform with its `sha256`, whether the selected kernel is in it, and
+  whether the installed version is the manifest's. It exits 0, or 2 if the kernel override is invalid. Without
+  `--json` it prints a short human-readable summary.
+
+A typical agent flow: fetch the manifest, take `manifest.match.url` and `sha256` from `doctor --json --manifest URL`
+(or match `platform_tag` yourself), install, check that `test_status.per_kernel[<selected kernel>]` is `passed`, then
+run `verify ... --cross-check` once on a known circuit.
 
 ## Measured results
 
@@ -117,7 +166,9 @@ per run), but the ratios held steady across the alternating rounds. Peak memory 
 physical footprint. The engine's single process is set against the verifier's worker processes, which is how each one
 is meant to run. These numbers are for engine 0.2.0. Version 0.3.0 changes only the one-off compile step, which now
 also computes `reaction_depth` (1.13 s for this circuit, measured locally, against 1.17 s for 0.2.0), so the table
-was not re-measured. invsqrt is less accelerated: about 1.8x the fork at 10 threads on the sample submission
+was not re-measured. Version 0.4.0 adds the x86_64 kernels; on Apple Silicon the simulation code is the same
+(DQI cross-check 5.7 s cold at 10 threads, as for 0.3.0). The x86 kernels have not been timed on real x86 hardware
+yet. invsqrt is less accelerated: about 1.8x the fork at 10 threads on the sample submission
 (31.5 s against 56.2 s, a single smoke run), because its per-shot checks still run in NumPy.
 
 Parity record (all on the circuits named above; the oracle is the unmodified official verifier on kickmix):
@@ -129,12 +180,16 @@ Parity record (all on the circuits named above; the oracle is the unmodified off
 | DQI sampler | 2 circuits x 3 salts x 400 batches: inputs, phases and the generator state after every batch identical to the official `sample_shots` |
 | DQI task parity | 2 circuits x 3 salts: every summary field and all 400 per-batch results identical |
 | `reaction_depth` | equal to kickmix's `Circuit.reaction_depth()` on both DQI circuits, two invsqrt circuits and thousands of random circuits covering every op kind |
+| x86_64 kernels (0.4.0) | baseline and avx2, each forced in turn, on an x86_64 macOS build under Rosetta 2: invsqrt per-shot parity (106,496 shots) and DQI per-shot parity on 4ee7a17b4cbc (2,048 shots, controls mismatch), 0 mismatches; DQI `--cross-check` at salt-check-1 equal on every field against the official verifier on the same x86_64 interpreter. avx512: compiled, awaiting AVX-512 hardware (CI or Kaggle) |
 | FAIL paths | dirty ancilla, syndrome not restored, x not restored, dirty scratch, error-rate and phase-tolerance failures: same status and message as the official verifier |
 
 ## Reproduce the parity claims
 
 The scripts in `tests/` need kickmix and the official verifiers (set `KICKMIX_ENGINE_VERIFIERS`). They write a JSON
-report, refuse to overwrite an existing one, and exit non-zero on any mismatch. Run them from the repository root with
+report, refuse to overwrite an existing one, and exit non-zero on any mismatch. Set `KICKMIX_ENGINE_KERNEL` to
+check a particular x86_64 kernel (the report records which kernel ran). Compare summaries from the same platform:
+`mean_error_weight` is computed by the verifier itself in NumPy and can differ in the last bit between arm64 and x86_64
+NumPy builds. Run them from the repository root with
 `kickmix_engine` installed (or `PYTHONPATH=python` after `./build.sh`).
 
 ```sh
@@ -174,8 +229,14 @@ with kickmix by `tests/make_fixtures.py` and `tests/reaction_depth_parity.py`. T
 their inputs as arguments (`--kmb`, `--verifier`) or environment variables (`FORK_PY`, `ENGINE_PY`, `VERIFIER`, `KMB`,
 `EVIDENCE`), as each script's header documents.
 
+To test every kernel your CPU supports: `python tools/ci_kernel_tests.py --tests tests --wheel dist/X.whl --status
+status.json`. It runs pytest once per kernel with `KICKMIX_ENGINE_KERNEL` set, and records kernels the CPU lacks as
+skipped. The parity scripts below honour the same variable.
+
 ## How it works
 
+- **Kernels** (`src/kernel.rs`): run-time choice of the baseline, AVX2 or AVX-512 copy of the simulator and sampler
+  on x86_64 (see [Kernels](#kernels-x86_64)).
 - **Simulator** (`src/sim.rs`, `src/engine.rs`): 256 shots per group of four 64-bit words per qubit or bit. It follows
   kickmix's semantics: condition stack, 128-bit fixed-point angles, global phase, HMR/R outcomes from kickmix's random
   number chain (std::seed_seq, mt19937_64, then ChaCha8 keys per 256-shot simulator) and exact per-kind operation
@@ -199,6 +260,10 @@ their inputs as arguments (`--kmb`, `--verifier`) or environment variables (`FOR
 - On FAIL the engine reports the first failure in task order, as the official verifier does. That has been checked on
   the FAIL cases listed above, not on every possible failure.
 - Wheels are built for macOS arm64 and Linux x86_64 only. Big-endian hosts are not supported (cache format).
+- The AVX2 and baseline kernels have been checked for per-shot parity locally under Rosetta 2 (an x86_64 macOS build,
+  with `ROSETTA_ADVERTISE_AVX=1`) and in CI on GitHub's Linux runners. The AVX-512 kernel runs only where the CPU has
+  AVX-512 (some GitHub runners, Kaggle's Intel hosts). Check `test_status.per_kernel` in the release manifest before
+  relying on it.
 - The speed and memory figures come from one Apple Silicon machine. They have not been measured on Linux or on
   Kaggle.
 

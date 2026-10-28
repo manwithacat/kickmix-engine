@@ -135,7 +135,40 @@ impl Sim {
         Ok(out)
     }
 
+    /// Run the program on this sim with the process's kernel (see `kernel`): the same body compiled for baseline
+    /// x86-64, AVX2 (x86-64-v3) or AVX-512 (x86-64-v4); on aarch64 the single (NEON) build.
     pub fn run<const COUNT: bool>(&mut self, prog: &Program) {
+        #[cfg(target_arch = "x86_64")]
+        {
+            use crate::kernel::Kernel;
+            // SAFETY: `kernel::active()` returns Avx2/Avx512 only if `is_x86_feature_detected!` found every
+            // feature these copies are compiled with.
+            match crate::kernel::active() {
+                Kernel::Avx512 => unsafe { self.run_avx512::<COUNT>(prog) },
+                Kernel::Avx2 => unsafe { self.run_avx2::<COUNT>(prog) },
+                _ => self.run_impl::<COUNT>(prog),
+            }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        self.run_impl::<COUNT>(prog)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2,bmi1,bmi2,fma,lzcnt,movbe")]
+    unsafe fn run_avx2<const COUNT: bool>(&mut self, prog: &Program) {
+        self.run_impl::<COUNT>(prog)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2,bmi1,bmi2,fma,lzcnt,movbe,avx512f,avx512bw,avx512vl,avx512dq")]
+    unsafe fn run_avx512<const COUNT: bool>(&mut self, prog: &Program) {
+        self.run_impl::<COUNT>(prog)
+    }
+
+    /// The simulator loop. `inline(always)` so each kernel wrapper above gets its own copy compiled with its
+    /// target features (W's operations are `inline(always)` too and vectorise to the widest registers enabled).
+    #[inline(always)]
+    fn run_impl<const COUNT: bool>(&mut self, prog: &Program) {
         let code = prog.code.as_ptr();
         let n = prog.code.len();
         let qp = self.q.as_mut_ptr();
@@ -314,6 +347,7 @@ impl Sim {
 }
 
 /// In-place 64x64 bit-matrix transpose: out[c] bit r = in[r] bit c.
+#[inline]
 pub fn transpose64(a: &mut [u64; 64]) {
     let mut j = 32usize;
     let mut m: u64 = 0x0000_0000_FFFF_FFFF;

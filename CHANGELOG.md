@@ -3,6 +3,34 @@
 All notable changes to kickmix-engine. Dates are UTC. The project was written by an AI model (Claude) under the
 owner's direction; see NOTICE.
 
+## 0.4.0 (2026-10-28, unreleased)
+
+### Added
+- Run-time kernel dispatch on x86_64 (`src/kernel.rs`). The simulator loop (`Sim::run`) and the exact DQI sampler are
+  compiled for baseline x86-64, AVX2 (x86-64-v3: avx2, bmi1, bmi2, fma, lzcnt, movbe) and AVX-512 (v3 + avx512f,
+  avx512bw, avx512vl, avx512dq) from one source. The best kernel the CPU supports is chosen once per process.
+  `KICKMIX_ENGINE_KERNEL=baseline|avx2|avx512` forces one, and it is an error if the CPU lacks it. aarch64 keeps its
+  single build, reported as `neon`.
+- `kickmix_engine.kernel_info()` and `kickmix_engine.cpu_info()`. `verify --timing` and `--cross-check` report the
+  kernel. The parity scripts record it in their JSON output.
+- `kickmix-engine doctor [--json] [--manifest PATH_OR_URL]`: platform, Python, CPU features, compiled, available and
+  selected kernels, engine version and extension hash, cache directory, whether kickmix and the official verifiers
+  import, and (with a manifest) the matching wheel and its SHA-256.
+- `release-manifest.json`, built by `tools/make_release_manifest.py`: every wheel with its tags, SHA-256, size,
+  kernels and their required CPU features, and per-kernel CI test status, plus the version, commit, CI run and sdist.
+  The workflow uploads it as an artifact on every run and attaches it to `v*` releases.
+- `tools/ci_kernel_tests.py`: runs the tests once per kernel the machine supports and writes a status file.
+- Tests for kernel selection and for the error when a kernel is unavailable.
+
+### Changed
+- CI (`wheels.yml`): the Linux x86_64 test job prints `kickmix-engine doctor --json` and runs the tests once per
+  supported kernel (unsupported kernels are skipped with a notice). A new `manifest` job builds the manifest, and the
+  release job attaches it and refuses to publish unless its `test_status` is `passed`. The macOS test commands are
+  unchanged; a step now records their outcome for the manifest.
+- `verify` exits 2 with `{"status": "ERROR"}` if `KICKMIX_ENGINE_KERNEL` cannot be honoured.
+- The program cache format is unchanged (2). Entries are still keyed by the extension's hash, so 0.3.0 entries are
+  not reused.
+
 ## 0.3.0 (2026-10-28, unreleased)
 
 ### Added

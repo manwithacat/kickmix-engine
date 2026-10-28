@@ -58,6 +58,7 @@ impl<T> SP<T> {
 }
 
 pub fn run(spec: &RunSpec) -> Result<Out, String> {
+    crate::kernel::selected()?;
     let nch = spec.seeds.len();
     let (s, bb) = (spec.s, spec.b);
     let shots_per_batch = 256 * s;
@@ -240,6 +241,7 @@ pub struct BatchOut {
 }
 
 pub fn run_batches(spec: &BatchSpec) -> Result<BatchOut, String> {
+    crate::kernel::selected()?;
     let p = spec.prog;
     let nb = spec.seeds.len();
     let (nqi, nbi) = (spec.qin_ids.len(), spec.bin_ids.len());
@@ -395,6 +397,7 @@ pub struct DqiOut {
 }
 
 pub fn run_dqi(spec: &DqiSpec) -> Result<DqiOut, String> {
+    crate::kernel::selected()?;
     let p = spec.prog;
     let nb = spec.seeds.len();
     spec.sampler.check()?;
@@ -474,6 +477,7 @@ pub struct SampleOut {
 
 /// The sampler alone (for proofs and self-checks).
 pub fn sample_dqi(sampler: &DqiSampler, pcg: &[Pcg64], threads: usize, keep_values: bool) -> Result<SampleOut, String> {
+    crate::kernel::selected()?;
     sampler.check()?;
     let res: Vec<(crate::dqi_sample::DqiBatch, Pcg64)> = pool(threads).install(|| {
         pcg.par_iter()

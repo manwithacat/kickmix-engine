@@ -214,3 +214,54 @@ sample vs fork and 1.0.0).
 - invsqrt checks still run in NumPy (about 1.6-1.8x the fork); no Linux or Kaggle numbers in the README.
 - `cargo clippy` reports 22 style warnings in older code (indexing loops, manual slice copies); none are correctness
   issues and none were changed in this pass, to avoid touching the proven hot paths.
+
+# Addendum C report, 2026-10-28 (package version 0.4.0; branch `main` at 7711ab3, uncommitted)
+
+Card: `experiments/2026-10-28-engine-m3-dqi.md`, Addendum C (competition repo). Evidence:
+`outputs/engine-avx-2026-10-28/` (ENVIRONMENT.txt, steps.log, one JSON/log per check; `x86_rosetta/` for the x86 runs).
+
+## Changes
+
+- `src/kernel.rs`: kernel enum, CPU feature detection, the once-per-process choice (best available, or
+  `KICKMIX_ENGINE_KERNEL`, an error if unavailable). `Sim::run` and `DqiSampler::sample` are now dispatchers over
+  `#[inline(always)]` bodies (`run_impl`, `sample_impl`) with `#[target_feature]` wrappers for AVX2
+  (avx2,bmi1,bmi2,fma,lzcnt,movbe) and AVX-512 (that + avx512f,avx512bw,avx512vl,avx512dq) on x86_64. aarch64 is
+  unchanged (`neon`). Every engine entry point (`run`, `run_batches`, `run_dqi`, `sample_dqi`) checks the selection
+  first, so a bad override fails before any work.
+- Python: `kernel_info()`, `cpu_info()`; `verify --timing` / `--cross-check` report the kernel; exit 2 on a bad
+  override; `kickmix-engine doctor [--json] [--manifest]` (`python/kickmix_engine/doctor.py`).
+- `tools/make_release_manifest.py` (reads the feature lists from kernel.rs and checks the target_feature attributes
+  match), `tools/ci_kernel_tests.py`, and the `wheels.yml` changes (Linux per-kernel tests + doctor, `manifest` job on
+  every run, release gated on manifest `test_status == passed`).
+- The parity scripts record `kernel` in their JSON output. Two new pytest tests (selection, override errors).
+
+## Results
+
+| check | arm64 (neon) | x86_64 baseline (Rosetta) | x86_64 avx2 (Rosetta) | avx512 |
+| --- | --- | --- | --- | --- |
+| pytest (13 tests) | pass | pass | pass | skipped: CPU lacks it |
+| M1 invsqrt per-shot parity, 106,496 shots | 0 mismatches, control mismatches | same | same | - |
+| DQI gate-1 short, 4ee7, 2,048 shots | 0 mismatches, both controls mismatch | same | same | - |
+| DQI `--cross-check` 4ee7 salt-check-1 | match vs fork (score 414781480388.3637, rd 9339) | match vs official on x86_64 kickmix 1.0.0 | same | - |
+
+The x86 kernels ran on an x86_64 macOS build of the same tree (cross-compiled, extension sha256 3e2ac930...) under
+Rosetta 2, which with `ROSETTA_ADVERTISE_AVX=1` exposes the full x86-64-v3 set (no AVX-512). The in-process oracle
+there is kickmix 1.0.0's x86_64 wheel. The disassembly shows distinct kernels: the AVX2 copies use ymm registers, the
+AVX-512 copies use EVEX `vpternlog` (and zmm in the sampler).
+
+The first x86 cross-checks (engine on x86_64, official verifier on the arm64 fork) differed in one field,
+`mean_error_weight`: 31.046737331746648 against 31.046737331746655, the same for both kernels. Both sides compute it
+with the verifier's own expression `np.arange(len(weight_probs)) @ weight_probs`, so the difference comes from
+arm64 and x86_64 NumPy builds rounding differently, not from the simulator. With the official verifier on the same
+x86_64 interpreter, both kernels match on every field. The same 1-ulp difference should appear between a Mac and a
+Kaggle run of the official verifier itself. Both runs are kept.
+
+Linux: `cargo clippy --target x86_64-unknown-linux-gnu` is clean (22 old style warnings, none new). The manylinux
+wheel itself is built only in CI.
+
+## Still open
+
+- CI has to confirm the Linux wheel: build, the per-kernel test loop (baseline and avx2 on GitHub's runners; avx512
+  only if the runner has it), doctor output and the manifest job. The workflow changes have not run yet.
+- AVX-512 parity, and timing of every kernel on real x86 hardware: the Kaggle notebook, one forced kernel per run.
+- Rosetta timings are not evidence of x86 speed (AVX2 under Rosetta was slower than baseline: 12.0 s against 8.5 s).
