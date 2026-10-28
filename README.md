@@ -167,9 +167,21 @@ physical footprint. The engine's single process is set against the verifier's wo
 is meant to run. These numbers are for engine 0.2.0. Version 0.3.0 changes only the one-off compile step, which now
 also computes `reaction_depth` (1.13 s for this circuit, measured locally, against 1.17 s for 0.2.0), so the table
 was not re-measured. Version 0.4.0 adds the x86_64 kernels; on Apple Silicon the simulation code is the same
-(DQI cross-check 5.7 s cold at 10 threads, as for 0.3.0). The x86 kernels have not been timed on real x86 hardware
-yet. invsqrt is less accelerated: about 1.8x the fork at 10 threads on the sample submission
+(DQI cross-check 5.7 s cold at 10 threads, as for 0.3.0). invsqrt is less accelerated: about 1.8x the fork at 10 threads on the sample submission
 (31.5 s against 56.2 s, a single smoke run), because its per-shot checks still run in NumPy.
+
+**On Kaggle's CPU notebooks** (2026-10-28, private benchmark notebook, internet off, all three builds installed from
+wheels): Intel Xeon @ 2.20 GHz (CPU model 79, Broadwell class), 4 vCPUs = 2 cores x 2 threads, AVX2 but no AVX-512,
+31 GiB RAM. Same circuit and salt, engine 0.2.0 (baseline x86-64 build), medians of 2 alternating rounds, memory as the
+process tree's summed PSS (shared pages counted once, so lower than the macOS footprint figures). All 16 runs
+returned the identical result.
+
+| workers / threads | kickmix 1.0.0 | kickmix-macos 0.3.0 | engine cold | engine warm | warm vs fork | warm vs 1.0.0 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | 488.4 s / 4,579 MiB | 175.3 s / 1,907 MiB | 79.6 s / 316 MiB | 79.4 s / 315 MiB | 2.2x | 6.2x |
+| 4 | 282.7 s / 4,552 MiB | 87.0 s / 1,888 MiB | 41.7 s / 341 MiB | 41.2 s / 330 MiB | 2.1x | 6.9x |
+
+A per-kernel comparison (baseline vs AVX2) on the same Kaggle hardware with 0.4.0 is in progress and will be added here.
 
 Parity record (all on the circuits named above; the oracle is the unmodified official verifier on kickmix):
 
@@ -180,7 +192,7 @@ Parity record (all on the circuits named above; the oracle is the unmodified off
 | DQI sampler | 2 circuits x 3 salts x 400 batches: inputs, phases and the generator state after every batch identical to the official `sample_shots` |
 | DQI task parity | 2 circuits x 3 salts: every summary field and all 400 per-batch results identical |
 | `reaction_depth` | equal to kickmix's `Circuit.reaction_depth()` on both DQI circuits, two invsqrt circuits and thousands of random circuits covering every op kind |
-| x86_64 kernels (0.4.0) | baseline and avx2, each forced in turn, on an x86_64 macOS build under Rosetta 2: invsqrt per-shot parity (106,496 shots) and DQI per-shot parity on 4ee7a17b4cbc (2,048 shots, controls mismatch), 0 mismatches; DQI `--cross-check` at salt-check-1 equal on every field against the official verifier on the same x86_64 interpreter. avx512: compiled, awaiting AVX-512 hardware (CI or Kaggle) |
+| x86_64 kernels (0.4.0) | baseline and avx2, each forced in turn, on an x86_64 macOS build under Rosetta 2: invsqrt per-shot parity (106,496 shots) and DQI per-shot parity on 4ee7a17b4cbc (2,048 shots, controls mismatch), 0 mismatches; DQI `--cross-check` at salt-check-1 equal on every field against the official verifier on the same x86_64 interpreter. In CI on GitHub's Linux runner (AMD EPYC 9V74, Zen 4, AVX-512), the test suite (13 tests, including random-circuit parity against stored kickmix references and the sampler restatement) passes with each of baseline, avx2 and avx512 forced, on Python 3.12 and 3.13 |
 | FAIL paths | dirty ancilla, syndrome not restored, x not restored, dirty scratch, error-rate and phase-tolerance failures: same status and message as the official verifier |
 
 ## Reproduce the parity claims
@@ -260,12 +272,12 @@ skipped. The parity scripts below honour the same variable.
 - On FAIL the engine reports the first failure in task order, as the official verifier does. That has been checked on
   the FAIL cases listed above, not on every possible failure.
 - Wheels are built for macOS arm64 and Linux x86_64 only. Big-endian hosts are not supported (cache format).
-- The AVX2 and baseline kernels have been checked for per-shot parity locally under Rosetta 2 (an x86_64 macOS build,
-  with `ROSETTA_ADVERTISE_AVX=1`) and in CI on GitHub's Linux runners. The AVX-512 kernel runs only where the CPU has
-  AVX-512 (some GitHub runners, Kaggle's Intel hosts). Check `test_status.per_kernel` in the release manifest before
-  relying on it.
-- The speed and memory figures come from one Apple Silicon machine. They have not been measured on Linux or on
-  Kaggle.
+- Full per-shot DQI and invsqrt parity runs have been done for the baseline and AVX2 kernels (locally, x86_64 under
+  Rosetta 2). The AVX-512 kernel has passed the CI test suite on an AMD Zen 4 runner but not yet the full per-shot DQI
+  parity run, and Kaggle's CPU notebooks (Broadwell-class Xeon) have no AVX-512. Check `test_status.per_kernel` in the
+  release manifest before relying on a kernel.
+- Speed and memory have been measured on one Apple Silicon machine and on Kaggle's CPU notebooks, for one DQI circuit.
+  Other machines, circuits and salts may differ; `verify --timing` reports what you get.
 
 ## Licence
 
@@ -273,4 +285,4 @@ Apache-2.0 (see [LICENSE](LICENSE)). The simulation semantics, the random-number
 definition follow kickmix (Copyright Google LLC, Apache-2.0). The task adapters call the official verifiers (Copyright
 Google LLC, Apache-2.0), which are not included. The DQI sampler reproduces NumPy's random-number algorithms
 (BSD-3-Clause), without NumPy source code. Details are in [NOTICE](NOTICE), and changes are listed in
-[CHANGELOG.md](CHANGELOG.md).
+[CHANGELOG.md](CHANGELOG.md); plans are in [ROADMAP.md](ROADMAP.md).
