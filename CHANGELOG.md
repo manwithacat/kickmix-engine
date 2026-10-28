@@ -31,7 +31,7 @@ owner's direction; see NOTICE.
 - The program cache format is unchanged (2). Entries are still keyed by the extension's hash, so 0.3.0 entries are
   not reused.
 
-## 0.3.0 (2026-10-28, unreleased)
+## 0.3.0 (2026-10-28, not released separately; included in 0.4.0)
 
 ### Added
 - `reaction_depth` is now computed. It follows kickmix's `Circuit.reaction_depth()` rule for rule, in the same pass
