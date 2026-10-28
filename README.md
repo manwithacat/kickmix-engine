@@ -138,8 +138,18 @@ the official verifier on the kickmix-macos 0.3.0 fork. Times are the `verify()` 
 | 998607123fc8 (N=76, R=8, B=143; 78,080 shots) | 7.30 s | 1.06 s (6.9x) | 2.03 s (3.6x) | 5.97 / 6.96 s | 1,320 / 895 MiB |
 | sample_submission (R=65, B=60; 254,464 shots) | 15.25 s | 2.47 s (6.2x) | 7.45 s (2.0x) | not measured | 2,368 / 1,731 MiB |
 
-"Cold" means an empty cache: the FCIDUMP is parsed as in the official verifier, so the gain is small. Kaggle CPU
-figures are not measured yet.
+"Cold" means an empty cache: the FCIDUMP is parsed as in the official verifier, so the gain is small.
+
+**On Kaggle's CPU notebook** (Xeon, 4 vCPUs; engine 0.5.0 from the public wheels dataset; family de8eb0bf484f; medians
+of 2 alternating rounds; memory as summed PSS; every run returned the identical summary):
+
+| build | time | vs kickmix 1.0.0 | peak PSS |
+| --- | --- | --- | --- |
+| kickmix 1.0.0 (official verifier) | 17.66 s | 1.00x | 884 MiB |
+| kickmix-macos 0.3.0 (official verifier) | 14.79 s | 1.19x | 826 MiB |
+| engine, cold cache, 4 threads | 14.06 s | 1.26x | 704 MiB |
+| engine, warm cache, 1 thread | 4.23 s | 4.18x | 693 MiB |
+| engine, warm cache, 4 threads | 3.60 s | **4.90x** | 694 MiB |
 
 ## Kernels (x86_64)
 
