@@ -1,10 +1,11 @@
 #!/bin/bash
 # Re-run gates 2 and 3 into a new evidence directory; call when the machine is otherwise idle.
-# Usage: rerun_when_idle.sh TAG   (writes outputs/engine-m1-2026-10-27/{single_core,scaling,kickmix_scaling}_TAG.json)
+# Usage: FORK_PY=/path/to/python-with-kickmix EVIDENCE=DIR rerun_when_idle.sh TAG
+# (writes DIR/{single_core,scaling,kickmix_scaling}_TAG.json; M1 used outputs/engine-m1-2026-10-27 of the competition repo)
 set -e
-R=/Volumes/SSD/Kaggle/tools/kickmix-engine
-E=/Volumes/SSD/Kaggle/competitions/google-verifiable-quantum-circuit-compilation/outputs/engine-m1-2026-10-27
-K=/private/tmp/claude-501/-Volumes-SSD-Kaggle/bede4ed6-52b3-426f-9474-6b45a869e799/scratchpad/cxpop313/bin/python
+R=$(cd "$(dirname "$0")/.." && pwd)
+E=${EVIDENCE:?set EVIDENCE}
+K=${FORK_PY:?set FORK_PY}
 T=$1; [ -e "$E/scaling_$T.json" ] && { echo "refusing to overwrite $E/scaling_$T.json"; exit 1; }
 uptime
 PYTHONPATH=$R/python $K $R/bench/single_core.py $E/single_core_$T.json --rounds 10

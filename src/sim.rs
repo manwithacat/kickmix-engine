@@ -54,19 +54,24 @@ impl BitXorAssign for W {
 /// Per-sim operation counts, summed over shots (per op kind, merged over `_IF` variants) plus Z_POW level counts.
 #[derive(Clone)]
 pub struct Counts {
-    full: [u64; NKINDS],
-    part: [u64; NKINDS],
+    pub full: [u64; NCOUNT],
+    pub part: [u64; NCOUNT],
     zfull: [u64; 129],
     zpart: [u64; 129],
 }
+impl Default for Counts {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 impl Counts {
     pub fn new() -> Self {
-        Counts { full: [0; NKINDS], part: [0; NKINDS], zfull: [0; 129], zpart: [0; 129] }
+        Counts { full: [0; NCOUNT], part: [0; NCOUNT], zfull: [0; 129], zpart: [0; 129] }
     }
-    /// Per kind totals (CXRUN folded into CX) over shots.
-    pub fn kinds(&self) -> [u64; 17] {
-        let mut out = [0u64; 17];
-        for k in 0..17 {
+    /// Per kind totals over the 256 shots (count slots, see `KIND_NAMES`).
+    pub fn kinds(&self) -> [u64; NCOUNT] {
+        let mut out = [0u64; NCOUNT];
+        for k in 0..NCOUNT {
             out[k] = self.full[k] * 256 + self.part[k];
         }
         out
@@ -93,11 +98,11 @@ pub struct Sim {
 impl Sim {
     pub fn new(prog: &Program, keys: Keys) -> Sim {
         Sim {
-            q: vec![W::ZERO; prog.num_qubits],
+            q: vec![W::ZERO; prog.num_qubits.max(1)],
             bits: vec![W::ZERO; prog.num_bits.max(1)],
             phase: W::ZERO,
             angles: vec![0u128; 256],
-            stack: Vec::with_capacity(8),
+            stack: Vec::with_capacity(prog.max_stack_depth.max(8)),
             rng: ChaCha8::new(keys),
             counts: Counts::new(),
         }
@@ -112,9 +117,27 @@ impl Sim {
         self.stack.clear();
     }
 
+    /// Final phase per shot as kickmix `read_phase_flipped_across_shots` reads it: `Err` if any shot's phase is
+    /// not a multiple of a half turn.
+    pub fn phase_flipped(&self, has_angles: bool) -> Result<W, String> {
+        if !has_angles {
+            return Ok(self.phase);
+        }
+        let mut out = W::ZERO;
+        for s in 0..256 {
+            let ph = (self.phase.0[s / 64] >> (s % 64)) & 1;
+            let v = self.angles[s] ^ ((ph as u128) << 127);
+            if v << 1 != 0 {
+                return Err("phase angles other than 0 and a half turn are present".into());
+            }
+            out.0[s / 64] |= ((v >> 127) as u64) << (s % 64);
+        }
+        Ok(out)
+    }
+
     pub fn run<const COUNT: bool>(&mut self, prog: &Program) {
-        let ops = prog.ops.as_ptr();
-        let n = prog.ops.len();
+        let code = prog.code.as_ptr();
+        let n = prog.code.len();
         let qp = self.q.as_mut_ptr();
         let bp = self.bits.as_mut_ptr();
         let angles = &mut self.angles;
@@ -125,76 +148,102 @@ impl Sim {
         let mut base = W::ONES;
         let mut full = true;
         let mut i = 0usize;
-        // SAFETY: Program construction guarantees qubit ids < num_qubits (Sim::new sizes q from it) and compact bit
-        // ids < num_bits; `ops` has n entries and run headers are followed by that many ops.
+        if COUNT {
+            // INFO_TAG: counted with an all-ones mask on every execution, no other effect.
+            counts.full[K_INFO as usize] += prog.n_info_tags;
+        }
+        // SAFETY: the Builder guarantees qubit ids < num_qubits (Sim::new sizes q from it), compact bit ids <
+        // num_bits, angle indices < angles.len(), every opcode has its OP_LEN words and run headers are followed
+        // by that many entries.
         unsafe {
             while i < n {
-                let op = *ops.add(i);
-                i += 1;
+                let w0 = *code.add(i);
+                let opc = (w0 & 0xFF) as u8;
+                if opc == K_CXRUN {
+                    let cnt = (w0 >> 8) as usize;
+                    let run = code.add(i + 1);
+                    i += 1 + cnt;
+                    if full {
+                        for j in 0..cnt {
+                            let r = *run.add(j);
+                            let t = *qp.add((r & 0xFFFF) as usize);
+                            *qp.add((r >> 16) as usize) ^= t;
+                        }
+                        if COUNT {
+                            counts.full[K_CX as usize] += cnt as u64;
+                        }
+                    } else {
+                        for j in 0..cnt {
+                            let r = *run.add(j);
+                            let t = base & *qp.add((r & 0xFFFF) as usize);
+                            *qp.add((r >> 16) as usize) ^= t;
+                        }
+                        if COUNT {
+                            counts.part[K_CX as usize] += cnt as u64 * base.popcnt();
+                        }
+                    }
+                    continue;
+                }
+                let len = OP_LEN[opc as usize] as usize;
+                debug_assert!(len != 0);
+                let a = (w0 >> 16) as usize;
                 let mut cond = base;
                 let mut cfull = full;
-                if op.flags & F_IF != 0 {
-                    cond = cond & *bp.add(op.cond as usize);
+                if opc & IF != 0 {
+                    cond = base & *bp.add(*code.add(i + len - 1) as usize);
                     cfull = false;
                 }
-                let (a, b, c) = (op.a as usize, op.b as usize, op.c as usize);
-                let mut mult = 1u64;
-                let mut kind = op.kind;
-                match op.kind {
+                let kind = opc & !IF;
+                match kind {
                     K_CX => {
+                        let b = (*code.add(i + 1) & 0xFFFF) as usize;
                         let t = cond & *qp.add(a);
                         *qp.add(b) ^= t;
                     }
-                    K_CXRUN => {
-                        let cnt = a;
-                        let run = ops.add(i);
-                        i += cnt;
-                        if full {
-                            for j in 0..cnt {
-                                let r = *run.add(j);
-                                let t = *qp.add(r.a as usize);
-                                *qp.add(r.b as usize) ^= t;
-                            }
-                        } else {
-                            for j in 0..cnt {
-                                let r = *run.add(j);
-                                let t = base & *qp.add(r.a as usize);
-                                *qp.add(r.b as usize) ^= t;
-                            }
-                        }
-                        mult = cnt as u64;
-                        kind = K_CX;
+                    K_CZ => {
+                        let b = (*code.add(i + 1) & 0xFFFF) as usize;
+                        phase ^= cond & *qp.add(a) & *qp.add(b);
                     }
-                    K_CZ => phase ^= cond & *qp.add(a) & *qp.add(b),
-                    K_CCX => {
-                        let t = cond & *qp.add(a) & *qp.add(b);
-                        *qp.add(c) ^= t;
-                    }
-                    K_X => *qp.add(a) ^= cond,
-                    K_Z => phase ^= cond & *qp.add(a),
-                    K_NEG => phase ^= cond,
-                    K_CCZ => phase ^= cond & *qp.add(a) & *qp.add(b) & *qp.add(c),
                     K_SWAP => {
+                        let b = (*code.add(i + 1) & 0xFFFF) as usize;
                         let t = (*qp.add(a) ^ *qp.add(b)) & cond;
                         *qp.add(a) ^= t;
                         *qp.add(b) ^= t;
                     }
+                    K_CCX => {
+                        let w1 = *code.add(i + 1);
+                        let (b, c) = ((w1 & 0xFFFF) as usize, (w1 >> 16) as usize);
+                        let t = cond & *qp.add(a) & *qp.add(b);
+                        *qp.add(c) ^= t;
+                    }
+                    K_CCZ => {
+                        let w1 = *code.add(i + 1);
+                        let (b, c) = ((w1 & 0xFFFF) as usize, (w1 >> 16) as usize);
+                        phase ^= cond & *qp.add(a) & *qp.add(b) & *qp.add(c);
+                    }
                     K_CSWAP => {
+                        let w1 = *code.add(i + 1);
+                        let (b, c) = ((w1 & 0xFFFF) as usize, (w1 >> 16) as usize);
                         let m = cond & *qp.add(a);
                         let t = (*qp.add(b) ^ *qp.add(c)) & m;
                         *qp.add(b) ^= t;
                         *qp.add(c) ^= t;
                     }
-                    K_ST0 => *bp.add(b) &= !cond,
+                    K_X => *qp.add(a) ^= cond,
+                    K_Z => phase ^= cond & *qp.add(a),
+                    K_NEG => phase ^= cond,
+                    K_ST0 => *bp.add(*code.add(i + 1) as usize) &= !cond,
                     K_ST1 => {
-                        let v = *bp.add(b) | cond;
-                        *bp.add(b) = v;
+                        let t = *code.add(i + 1) as usize;
+                        let v = *bp.add(t) | cond;
+                        *bp.add(t) = v;
                     }
-                    K_INV => *bp.add(b) ^= cond,
+                    K_INV => *bp.add(*code.add(i + 1) as usize) ^= cond,
                     K_HMR => {
+                        let t = *code.add(i + 1) as usize;
                         let r = W(rng.next());
-                        let nb = (*bp.add(b) & !cond) ^ (r & cond);
-                        *bp.add(b) = nb;
+                        let nb = (*bp.add(t) & !cond) ^ (r & cond);
+                        *bp.add(t) = nb;
                         phase ^= *qp.add(a) & nb & cond;
                         *qp.add(a) &= !cond;
                     }
@@ -204,9 +253,10 @@ impl Sim {
                         *qp.add(a) &= !cond;
                     }
                     K_ZPOW => {
-                        let ang = prog.angles[b];
+                        let idx = *code.add(i + 1) as usize;
+                        let ang = *prog.angles.get_unchecked(idx);
                         if COUNT {
-                            let lv = prog.levels[b] as usize;
+                            let lv = *prog.levels.get_unchecked(idx) as usize;
                             if cfull {
                                 counts.zfull[lv] += 1;
                             } else {
@@ -225,7 +275,7 @@ impl Sim {
                         }
                     }
                     K_PUSH => {
-                        base &= cond_bit_only(&op, bp);
+                        base &= *bp.add(*code.add(i + 1) as usize);
                         stack.push(base);
                         full = false;
                         cond = W::ONES;
@@ -248,25 +298,19 @@ impl Sim {
                     }
                     _ => std::hint::unreachable_unchecked(),
                 }
+                i += len;
                 if COUNT {
                     let k = kind as usize;
                     if cfull {
-                        counts.full[k] += mult;
+                        counts.full[k] += 1;
                     } else {
-                        counts.part[k] += mult * cond.popcnt();
+                        counts.part[k] += cond.popcnt();
                     }
                 }
             }
         }
         self.phase = phase;
     }
-}
-
-/// PUSH_CONDITION uses its bit operand directly (`current_base &= bits[b]`); `cond` already includes the base,
-/// so re-read the bit itself. (The F_IF flag is always set on PUSH_CONDITION.)
-#[inline(always)]
-unsafe fn cond_bit_only(op: &Op, bp: *mut W) -> W {
-    *bp.add(op.cond as usize)
 }
 
 /// In-place 64x64 bit-matrix transpose: out[c] bit r = in[r] bit c.

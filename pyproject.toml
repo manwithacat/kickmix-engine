@@ -4,12 +4,29 @@ build-backend = "maturin"
 
 [project]
 name = "kickmix-engine"
-version = "0.1.0"
+version = "0.2.0"
+description = "Bit-sliced CPU simulator, per-shot compatible with kickmix, that runs the official VQCC invsqrt and DQI verifier flows"
+readme = "README.md"
 requires-python = ">=3.12"
-dependencies = ["numpy"]
-license = { text = "Apache-2.0" }
+dependencies = ["numpy>=1.26"]
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Topic :: Scientific/Engineering :: Physics",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[project.scripts]
+kickmix-engine = "kickmix_engine.cli:main"
 
 [tool.maturin]
 python-source = "python"
 module-name = "kickmix_engine._engine"
 features = ["pyo3/extension-module"]
+include = [{ path = "LICENSE", format = "sdist" }, { path = "NOTICE", format = "sdist" }]

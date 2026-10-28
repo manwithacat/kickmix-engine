@@ -3,17 +3,42 @@ Copyright 2026 James Barlow
 
 Licensed under the Apache License, Version 2.0 (see LICENSE).
 
-AI authorship. All code in this repository was written by an AI model (Claude,
-by Anthropic) under the direction of the repository owner, James Barlow, who is
-responsible for it. It is openly AI-assisted and is not presented as hand-written.
+AI authorship. All code, tests and documentation in this repository were written
+by an AI model (Claude, by Anthropic) under the direction of the repository
+owner, James Barlow, who reviews it and is responsible for it. It is openly
+AI-assisted and is not presented as hand-written.
 
-Derived semantics. The simulation semantics (operation set, condition stack,
-128-bit fixed-precision angles, global phase, HMR/R measurement outcomes) and the
+Derived from kickmix. The simulation semantics (operation set, condition stack,
+128-bit fixed-precision angles, global phase, HMR/R measurement outcomes,
+operation-statistics counting including INFO_TAG and PUSH/POP_CONDITION), the
 random-number chain (std::seed_seq -> mt19937_64 -> ChaCha8 keys, per-256-shot
-seeding) follow kickmix (distributed in Google's Qualtran project, https://github.com/quantumlib/Qualtran, directory kickmix/), Copyright Google LLC,
-licensed under the Apache License, Version 2.0. This crate is an independent Rust
-re-implementation checked for per-shot equality against kickmix; where the
-semantics were taken from kickmix source (sim/sim.h, util/chacha.h,
-util/fixed_precision_angle_128.*, py/interactive_simulator.pybind.cc) the
-attribution above applies. This project is not affiliated with or endorsed by
-Google LLC.
+seeding) and the .kmb file layout follow kickmix (distributed in Google's
+Qualtran project, https://github.com/quantumlib/Qualtran, directory kickmix/),
+Copyright Google LLC, licensed under the Apache License, Version 2.0. This crate
+is an independent Rust re-implementation checked for per-shot equality against
+kickmix. Where semantics were taken from kickmix source (sim/sim.h,
+util/chacha.h, util/fixed_precision_angle_128.*, circuit .kmb reader,
+py/interactive_simulator.pybind.cc, py/operation_statistics.pybind.cc), the
+attribution above applies.
+
+Official verifier logic. The task adapters (python/kickmix_engine/dqi.py,
+invsqrt.py) load the competition's official verifier modules at run time and
+call their functions; the verifiers are not included in this repository. The
+DQI sampler (src/dqi_sample.rs) re-implements the behaviour of the official
+`sample_shots`, and tests/test_engine.py restates that function for testing.
+The official verifiers are Copyright Google LLC, licensed under the Apache
+License, Version 2.0.
+
+NumPy algorithms. src/dqi_sample.rs re-implements, to reproduce NumPy's output
+exactly, the algorithms of NumPy's PCG64 bit generator (the PCG XSL-RR 128/64
+generator by Melissa O'Neill, with NumPy's 32-bit buffering), its 53-bit double
+conversion, its bounded-integer method (Lemire) and its Generator.choice
+algorithms. NumPy is Copyright NumPy Developers, BSD-3-Clause licence. No NumPy
+source code is included.
+
+Test data. tests/data/random_ops.kmb and random_ops_ref.npz were generated with
+kickmix by tests/make_fixtures.py. tests/data/dqi_logged_failing_shots.jsonl
+records failing shots observed by the owner when running the official DQI
+verifier on two public, Apache-2.0 competition circuits.
+
+This project is not affiliated with or endorsed by Google LLC.

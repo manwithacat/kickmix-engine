@@ -13,8 +13,9 @@ import kickmix as km
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "python"))
 import kickmix_engine as ke
 
-ROOT = '/Volumes/SSD/Kaggle/competitions/google-verifiable-quantum-circuit-compilation'
-VER = ROOT + '/data/official_full/verifiers/invsqrt/verify_submission_invsqrt.py'
+ROOT = '/Volumes/SSD/Kaggle/competitions/google-verifiable-quantum-circuit-compilation'  # the owner's machine
+VER = (os.path.join(os.environ['KICKMIX_ENGINE_VERIFIERS'], 'invsqrt', 'verify_submission_invsqrt.py')
+       if os.environ.get('KICKMIX_ENGINE_VERIFIERS') else ROOT + '/data/official_full/verifiers/invsqrt/verify_submission_invsqrt.py')
 spec_ = importlib.util.spec_from_file_location('vinv', VER); v = importlib.util.module_from_spec(spec_)
 sys.modules['vinv'] = v; spec_.loader.exec_module(v)
 

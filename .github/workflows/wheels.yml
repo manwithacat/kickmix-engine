@@ -1,0 +1,117 @@
+# Build and test abi3 wheels (Python >= 3.12) for macOS arm64 and Linux x86_64 (manylinux).
+# On every push, pull request and manual run: wheels + sdist are uploaded as workflow artifacts.
+# On a tag push (v*): the same files are also attached to a GitHub release for that tag.
+name: wheels
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macos-arm64
+            os: macos-14
+            target: aarch64-apple-darwin
+            manylinux: "off"
+          - name: linux-x86_64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            manylinux: "2_28"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+          args: --release --locked --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.name }}
+          path: dist/*.whl
+          if-no-files-found: error
+
+  sdist:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  test:
+    name: test ${{ matrix.name }} py${{ matrix.python }}
+    needs: build
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        name: [macos-arm64, linux-x86_64]
+        python: ["3.12", "3.13"]
+        include:
+          - name: macos-arm64
+            os: macos-14
+          - name: linux-x86_64
+            os: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheel-${{ matrix.name }}
+          path: dist
+      - name: Install the built wheel (not the source tree)
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pytest dist/*.whl
+      - name: Tests (no kickmix or competition files needed)
+        working-directory: ${{ runner.temp }}
+        run: python -m pytest -v "${{ github.workspace }}/tests/test_engine.py" -p no:cacheprovider
+      - name: CLI smoke
+        working-directory: ${{ runner.temp }}
+        run: |
+          kickmix-engine --help
+          kickmix-engine cache info --cache-dir "${{ runner.temp }}/kme-cache"
+          python -c "import kickmix_engine as k; print(k.__version__, k.engine_version(), k.__file__)"
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build, sdist, test]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: cd dist && sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          fail_on_unmatched_files: true

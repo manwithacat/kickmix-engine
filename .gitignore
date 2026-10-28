@@ -2,3 +2,7 @@ target/
 __pycache__/
 *.so
 *.npz
+!tests/data/*.npz
+dist/
+*.egg-info/
+.pytest_cache/

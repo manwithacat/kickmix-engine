@@ -4,7 +4,9 @@ import numpy as np
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "python"))
 import kickmix_engine as ke
 
-CK = "/Volumes/SSD/Kaggle/competitions/google-verifiable-quantum-circuit-compilation/outputs/gpu-spike-2026-10-27/chachakeys"
+# C++ reference binary (std::seed_seq / mt19937_64 / ChaCha8 keys), built from the GPU spike's chachakeys.cc.
+CK = os.environ.get("KICKMIX_ENGINE_CHACHAKEYS",
+                    "/Volumes/SSD/Kaggle/competitions/google-verifiable-quantum-circuit-compilation/outputs/gpu-spike-2026-10-27/chachakeys")
 rng = np.random.default_rng(1)
 for trial in range(4):
     seed = int.from_bytes(rng.bytes(32), "little") if trial else 0
