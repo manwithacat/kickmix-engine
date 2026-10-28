@@ -1,0 +1,52 @@
+name: kaggle-mirror
+# Mirror a GitHub release to Kaggle as a new version of the dataset manwithacat/kickmix-engine-wheels: the release's
+# wheels, release-manifest.json and SHA256SUMS.txt, checked against the release checksums. Called by wheels.yml after
+# a tagged release is published; can also be run by hand for an existing tag (dry_run stages and authenticates only).
+# Never runs on pull requests, so the KAGGLE_API_TOKEN secret is not exposed to forks.
+on:
+  workflow_call:
+    inputs:
+      tag: { type: string, required: true }
+      dry_run: { type: boolean, default: false }
+    secrets:
+      KAGGLE_API_TOKEN: { required: true }
+  workflow_dispatch:
+    inputs:
+      tag: { description: "release tag, e.g. v0.4.0", type: string, required: true }
+      dry_run: { description: "stage and authenticate only", type: boolean, default: true }
+permissions:
+  contents: read
+
+jobs:
+  kaggle:
+    runs-on: ubuntu-24.04
+    env:
+      KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
+      TAG: ${{ inputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: python -m pip install "kaggle>=1.7.4.5"
+      - name: Check the token is set and accepted
+        run: |
+          test -n "$KAGGLE_API_TOKEN" || { echo "::error::secret KAGGLE_API_TOKEN is not set"; exit 1; }
+          kaggle datasets files manwithacat/kickmix-engine-wheels > /dev/null
+      - name: Stage the dataset from the release assets
+        run: |
+          set -euo pipefail
+          stage=stage/wheels && mkdir -p "$stage"
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir "$stage" \
+            --pattern '*.whl' --pattern release-manifest.json --pattern SHA256SUMS.txt
+          ls "$stage"/*manylinux*x86_64*.whl > /dev/null  # the Linux wheel is what Kaggle notebooks install
+          python3 -c "import json,sys; m=json.load(open('$stage/release-manifest.json')); print('manifest', m['engine_version'], m['git_ref'], m['test_status']); sys.exit(0 if m['test_status']=='passed' and m['git_ref']=='refs/tags/$TAG' else 1)"
+          # keep only the checksum lines for the files we stage (the release also lists the sdist)
+          (cd "$stage" && for f in *.whl release-manifest.json; do grep -E "  $f\$" SHA256SUMS.txt; done > SHA256SUMS.new \
+            && mv SHA256SUMS.new SHA256SUMS.txt && sha256sum --check SHA256SUMS.txt)
+          cp kaggle/wheels-dataset/dataset-metadata.json "$stage/"
+          ls -la "$stage"
+      - name: Push to Kaggle
+        if: ${{ !inputs.dry_run }}
+        run: kaggle datasets version -p stage/wheels -m "kickmix-engine $TAG (from the GitHub release)"

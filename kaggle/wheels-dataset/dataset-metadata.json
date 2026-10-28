@@ -1,0 +1,17 @@
+{
+ "title": "kickmix-engine wheels (offline install)",
+ "id": "manwithacat/kickmix-engine-wheels",
+ "subtitle": "Release wheels of kickmix-engine, a Rust simulator checked against kickmix",
+ "description": "Wheels of [kickmix-engine](https://github.com/manwithacat/kickmix-engine) for offline installation in Kaggle notebooks, mirrored automatically from each GitHub release (the dataset version message names the release tag). kickmix-engine is an independent Rust re-implementation of kickmix's simulation semantics, checked shot for shot against kickmix, with a `kickmix-engine verify` command for the invsqrt and DQI tasks of the Google Quantum AI - Verifiable Quantum Circuit Compilation competition. It runs the official verifier logic and can `--cross-check` every field against the official verifier.\n\nInstall in a notebook (internet off): `pip install --no-index --no-deps /kaggle/input/kickmix-engine-wheels/kickmix_engine-*-manylinux_2_28_x86_64.whl`. kickmix itself must also be importable (the official verifier modules import it): attach the competition data or the kickmix-fork-wheels dataset.\n\nFiles: the wheels, `release-manifest.json` (machine-readable: wheels, SHA-256, kernels and the CPU features each needs, test status, commit and CI run) and `SHA256SUMS.txt`. Run `kickmix-engine doctor --json --manifest /kaggle/input/kickmix-engine-wheels/release-manifest.json` to see which kernel your CPU gets.\n\nLicence Apache-2.0. Written by an AI model (Claude) under the owner's direction; derived from kickmix semantics (Copyright Google LLC, Apache-2.0); not affiliated with Google, Qualtran or Kaggle. Measured results, caveats and the parity record are in the GitHub README.",
+ "licenses": [
+  {
+   "name": "Apache 2.0"
+  }
+ ],
+ "keywords": [
+  "physics",
+  "computer science",
+  "programming",
+  "simulations"
+ ]
+}

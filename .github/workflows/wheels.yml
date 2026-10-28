@@ -214,3 +214,14 @@ jobs:
         with:
           files: dist/*
           fail_on_unmatched_files: true
+
+  kaggle:
+    # Mirror the published release to the Kaggle dataset manwithacat/kickmix-engine-wheels.
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [release]
+    uses: ./.github/workflows/kaggle-mirror.yml
+    with:
+      tag: ${{ github.ref_name }}
+      dry_run: false
+    secrets:
+      KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}

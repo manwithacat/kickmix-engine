@@ -39,6 +39,9 @@ Building from source needs Rust 1.80 or later:
 
 ```sh
 pip install maturin && maturin build --release --locked -o dist && pip install dist/*.whl
+# On Kaggle (internet off): attach the dataset manwithacat/kickmix-engine-wheels (mirrored from every release), then
+#   pip install --no-index --no-deps /kaggle/input/kickmix-engine-wheels/kickmix_engine-*-manylinux_2_28_x86_64.whl
+
 # For an in-place development build on macOS: ./build.sh, then put python/ on PYTHONPATH.
 ```
 
