@@ -1,14 +1,12 @@
 """Gate 3: throughput vs threads (engine only, counting on, verifier inputs). Run with the kickmix interpreter
-(needed once to load the .kmb). Usage: scaling.py OUT.json [--chunks N] [--rounds R]"""
+(needed once to load the .kmb). Usage: scaling.py OUT.json --kmb invsqrt.kmb [--chunks N] [--rounds R] [--threads 1,2,4,8,10]"""
 import argparse, json, os, subprocess, sys, time
 import numpy as np
 import kickmix as km
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "python"))
 import kickmix_engine as ke
-ROOT = '/Volumes/SSD/Kaggle/competitions/google-verifiable-quantum-circuit-compilation'
 ap = argparse.ArgumentParser(); ap.add_argument('out'); ap.add_argument('--chunks', type=int, default=320)
-ap.add_argument('--rounds', type=int, default=3); ap.add_argument('--threads', default='1,2,4,8,10'); a = ap.parse_args()
-c = km.Circuit.from_file(ROOT + '/outputs/kickmix-popfast-2026-10-27/v3sub/invsqrt.kmb', format='kmb')
+ap.add_argument('--rounds', type=int, default=3); ap.add_argument('--threads', default='1,2,4,8,10'); ap.add_argument('--kmb', required=True); a = ap.parse_args()
+c = km.Circuit.from_file(a.kmb, format='kmb')
 prog = ke.compile_circuit(c)
 MAX_X = 3 * (2**10 - 2)**2
 n = a.chunks

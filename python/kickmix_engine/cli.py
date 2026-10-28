@@ -4,15 +4,14 @@
     kickmix-engine verify invsqrt CIRCUIT.kmb [--salt S] [--threads N] [--cross-check] ...
     kickmix-engine cache info|prune|clear [--cache-dir DIR]
 
-`verify` prints the official verifier's summary JSON (same fields; `reaction_depth` is null because the engine does
-not compute it) and exits 0 on PASS, 1 on FAIL ({"status": "FAIL", "error": ...}), like the official CLI. The official
+`verify` prints the official verifier's summary JSON (same fields, including `reaction_depth`) and exits 0 on PASS,
+1 on FAIL ({"status": "FAIL", "error": ...}), like the official CLI. The official
 verifier file is required (it supplies seeds, sampling, the reference table and the statistics): pass --verifier or
 set KICKMIX_ENGINE_VERIFIERS to the competition's `verifiers/` directory. The verifier imports kickmix, so kickmix must
 be importable in this interpreter (the simulation itself does not use it).
 
 --cross-check also runs the official verifier CLI unchanged (in --official-python, default this interpreter) and
-prints {"engine": ..., "official": ..., "differences": ..., "match": bool}; exit code 3 if any field differs (other
-than reaction_depth, which only the official computes).
+prints {"engine": ..., "official": ..., "differences": ..., "match": bool}; exit code 3 if any field differs.
 """
 from __future__ import annotations
 
@@ -116,8 +115,6 @@ def cmd_verify(a):
                'stdout_tail': p.stdout[-2000:], 'stderr_tail': p.stderr[-2000:]}
     diffs = {}
     for k in sorted(set(eng) | set(off)):
-        if k == 'reaction_depth' and eng.get(k) is None:
-            continue
         if eng.get(k) != off.get(k):
             diffs[k] = {'engine': eng.get(k), 'official': off.get(k)}
     res = {'match': not diffs, 'differences': diffs, 'engine': eng, 'official': off,

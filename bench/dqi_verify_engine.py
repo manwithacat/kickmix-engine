@@ -2,7 +2,6 @@
 dqi_verify_engine.py circuit.kmb [--salt S] [--threads T] [--sampler engine|official] [--samplers P] [--group G]
 (M3 bench entry point; the release CLI is `kickmix-engine verify dqi`.)"""
 import argparse, json, os, sys
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'python'))
 from kickmix_engine import dqi
 
 ap = argparse.ArgumentParser()

@@ -55,6 +55,9 @@ impl PyProgram {
     fn max_stack_depth(&self) -> usize { self.inner.max_stack_depth }
     #[getter]
     fn num_cx_runs(&self) -> usize { self.inner.n_cx_runs }
+    /// kickmix `Circuit.reaction_depth()`, computed once at compile time and stored in the program cache.
+    #[getter]
+    fn reaction_depth(&self) -> u64 { self.inner.reaction_depth }
     #[getter]
     fn num_angles(&self) -> usize { self.inner.angles.len() }
     /// Bytes held by the compiled program (code words + angle table + bit maps).

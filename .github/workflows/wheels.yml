@@ -90,7 +90,7 @@ jobs:
           python -m pip install pytest dist/*.whl
       - name: Tests (no kickmix or competition files needed)
         working-directory: ${{ runner.temp }}
-        run: python -m pytest -v "${{ github.workspace }}/tests/test_engine.py" -p no:cacheprovider
+        run: python -m pytest -v -rs "${{ github.workspace }}/tests" -p no:cacheprovider
       - name: CLI smoke
         working-directory: ${{ runner.temp }}
         run: |

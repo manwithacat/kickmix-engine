@@ -14,7 +14,8 @@ checked by the parity tests:
   check they are equal for the circuits used);
 - registers are validated from the .kmb register table with the verifier's rules;
 - inputs are packed to bit-sliced words with `pack_rows`, which equals `np.packbits(to_bits(...))` (tested);
-- `reaction_depth` is not computed (reported as None).
+- `reaction_depth` is kickmix's `Circuit.reaction_depth()` computed by the engine at compile time (cached with the
+  program; checked against kickmix by `tests/reaction_depth_parity.py`).
 """
 from __future__ import annotations
 
@@ -238,7 +239,7 @@ class DQITask:
 
     def verify(self, *, salt='', seed=None, threads=1, sampler='engine', self_check=0, samplers=None, group=None,
                batch_size=256, log2_delta=None):
-        """Full verification; returns the official `verify()` summary (reaction_depth None).
+        """Full verification; returns the official `verify()` summary.
 
         sampler='engine' (default): inputs drawn on the engine, fused with simulation, `threads` Rayon threads.
         self_check: number of batches (evenly spaced; -1 = all) re-drawn with the official `sample_shots` and compared
@@ -413,7 +414,7 @@ class DQITask:
             'mean_error_weight': float(np.arange(len(weight_probs)) @ weight_probs),
             'toffoli_count': toffolis,
             'max_toffoli_count': int(sum(sc[KINDS.index(k)] for k in ('CCX', 'CCZ', 'CSWAP'))),
-            'reaction_depth': None,
+            'reaction_depth': int(self.prog.reaction_depth),
             'num_ops': self.prog.num_ops,
             'shot_operation_counts': counts,
             'num_qubits': nq,

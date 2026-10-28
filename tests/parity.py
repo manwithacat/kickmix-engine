@@ -1,29 +1,32 @@
 """Per-shot parity of kickmix-engine vs kickmix on the invsqrt circuit (run with the kickmix interpreter).
 
-Usage: parity.py OUT.json [--chunks 0,1,2,...] [--random-batches N] [--kmb PATH]
+Usage: parity.py OUT.json --kmb invsqrt.kmb [--verifier verify_submission_invsqrt.py] [--chunks 0,1,2,...]
+                 [--random-batches N]
+The official verifier comes from --verifier, else $KICKMIX_ENGINE_INVSQRT_VERIFIER, else
+$KICKMIX_ENGINE_VERIFIERS/invsqrt/verify_submission_invsqrt.py. kickmix_engine must be importable (installed wheel, or
+PYTHONPATH=python after ./build.sh).
 Compares, for every 256-shot batch and every shot: all qubit values, all classical bits (compacted ids mapped back; all
 untouched bits must be zero in kickmix), the exact 128-bit phase V, the verifier's 2^-64-turn units, x register
 read-back, scratch-nonzero flags; per chunk: per-op-kind counts, Z_POW level counts, Toffoli counts.
 Includes a wrong-seed negative control that must mismatch.
 """
-import argparse, importlib.util, json, os, sys, time
+import argparse, json, os, sys, time
 import numpy as np
 import kickmix as km
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "python"))
 import kickmix_engine as ke
 
-ROOT = '/Volumes/SSD/Kaggle/competitions/google-verifiable-quantum-circuit-compilation'  # the owner's machine
-VER = (os.path.join(os.environ['KICKMIX_ENGINE_VERIFIERS'], 'invsqrt', 'verify_submission_invsqrt.py')
-       if os.environ.get('KICKMIX_ENGINE_VERIFIERS') else ROOT + '/data/official_full/verifiers/invsqrt/verify_submission_invsqrt.py')
-spec_ = importlib.util.spec_from_file_location('vinv', VER); v = importlib.util.module_from_spec(spec_)
-sys.modules['vinv'] = v; spec_.loader.exec_module(v)
+from kickmix_engine.invsqrt import load_verifier
 
 ap = argparse.ArgumentParser()
 ap.add_argument('out'); ap.add_argument('--chunks', default='0,1,2,5000,12236')
 ap.add_argument('--random-batches', type=int, default=8)
-ap.add_argument('--kmb', default=ROOT + '/outputs/kickmix-popfast-2026-10-27/v3sub/invsqrt.kmb')
+ap.add_argument('--kmb', required=True, help='invsqrt circuit (.kmb)')
+ap.add_argument('--verifier', default=None, help='official verify_submission_invsqrt.py (default: from the environment)')
 a = ap.parse_args()
+if os.path.exists(a.out):
+    sys.exit(f'refusing to overwrite {a.out}')
+v = load_verifier(a.verifier)
 
 circuit = km.Circuit.from_file(a.kmb, format='kmb')
 sp = v.ProblemSpecInvSqrt.for_n_p(10)

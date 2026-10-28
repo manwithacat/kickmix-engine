@@ -165,3 +165,52 @@ kickmix-macos v0.3.0 release wheel. Local timings below are a labelled smoke tes
 - The invsqrt engine path keeps its checks in NumPy on the main thread (31.5 s at 10 threads, of which simulation is, by
   M1's measured 11M shots/s, about 18 s, an estimate). Moving the checks into Rust is the next speed step for invsqrt.
 - The DQI and invsqrt adapters need kickmix importable, because the official verifier modules import it.
+
+# Release clean-up report, 2026-10-28 (package version 0.3.0; branch `main`, uncommitted)
+
+Card: `experiments/2026-10-28-engine-m3-dqi.md` ("Release clean-up"). Evidence: `outputs/engine-cleanup-2026-10-28/`
+in the competition repo (ENVIRONMENT.txt lists the wheel, venvs, verifier and circuit hashes). Written by an AI model
+(Claude) under the owner's direction. All checks below ran on a locally built 0.3.0 wheel installed into clean venvs.
+
+## Changes
+- **reaction_depth** (`src/program.rs`, `ReactionDepth`): a streaming restatement of kickmix's
+  `compute_reaction_depth` (`circuit/circuit_util.cc`). Per qubit there is an x and a z depth and per bit a c depth,
+  with a condition-depth stack. Every op kind follows kickmix's case, including the order of the bumps and the
+  top-level resets of R, HMR, SWAP and BIT_STORE. It runs inside `Builder::op`, so it is computed once during
+  compilation and stored in the program cache (cache format 2, a ninth scalar field). Plain CX, 88% of the DQI ops,
+  takes an inlined fast path. DQI compile time is 1.13 s, against 1.17 s for 0.2.0 on the same machine. The adapters
+  report `int(prog.reaction_depth)`, and `--cross-check` no longer skips the field. The first version had the operand
+  order wrong. kickmix's `iter_ops` makes the *last* operand the target (2-qubit: control1, target; 3-qubit:
+  control2, control1, target). Random-circuit parity caught it at once (224 of 300 mismatched). The minimal
+  counterexample and the failed run are kept in the evidence `dev/` directory.
+- **FAIL paths** (`tests/fail_paths_crosscheck.py`): the base circuits come from the official reference builders, the
+  DQI decoder at m=30, n=4, degree=5 and the invsqrt Newton-Raphson circuit at n_p=10. A few ops are appended to each,
+  and every case runs through `verify --cross-check`.
+- **Paths and tests**: no script or document refers to the author's machine. Inputs come from arguments or environment
+  variables. The scripts no longer edit `sys.path`. `tests/test_rng.py` became a pytest module with a stored
+  reference, plus an optional C++ build of `tests/chachakeys.cc`. `tests/test_engine.py` gained `reaction_depth`
+  tests on a stored fixture of 25 random circuits (from kickmix 1.0.0) and on hand-checked small cases. `pytest`
+  from the repository root runs `tests/`, and so does CI.
+- **Docs**: README rewritten for new users, CHANGELOG added, NOTICE updated (reaction-depth derivation, the test
+  reference, fixtures, cross-check), version 0.3.0, repository URLs in the package metadata.
+
+## Results (installed 0.3.0 wheel; oracle = unmodified official verifier on kickmix-macos 0.3.0 or kickmix 1.0.0)
+| check | outcome |
+| --- | --- |
+| reaction_depth, random circuits | 2,000 circuits against the fork and 2,000 against kickmix 1.0.0 (3-400 ops, every kind, conditions, nested stacks, non-Clifford Z_POW; depths 1-89): all equal, compiled both from .kmb and from text |
+| reaction_depth, real circuits | DQI 4ee7a17b4cbc and b3354f60e459: 9339 = 9339; invsqrt sample: 4005 = 4005; invsqrt 07314803a092: 795 = 795 (kickmix `Circuit.reaction_depth()`, both kickmix builds) |
+| CLI `--cross-check`, all fields incl. reaction_depth | DQI 4ee7 salt-check-1 vs fork (score 414781480388.3637, 8-batch sampler self-check clean); DQI b3354 empty salt vs fork (422346240055.8793); DQI 4ee7 empty salt vs kickmix 1.0.0 (414781342770.7355); invsqrt sample vs fork and vs 1.0.0 (2076774.233715282); invsqrt 07314803a092 vs fork (102664.23957721348): 6/6 match, no differences |
+| FAIL paths | 10/10 match (status and message): DQI reference PASS 0 errors; dirty ancilla on every shot (value_errors 102400/102400), on part (44358/102400), rarely (PASS with 3185 value errors, full summary equal); syndrome not restored; invsqrt x not restored (early and late); dirty scratch (`q259`); dirty-scratch naming order (`q259`); first failure in task order wins (`q141` before a later x failure) |
+| M1 invsqrt per-shot parity | 106,496 shots, 0 mismatches; wrong-seed control mismatches |
+| DQI gate-1 parity (short: 4ee7, empty-salt batches 0 and 399, salt-check-1 #17, logged failures #381/#78, 3 random) | 2,048 shots, 0 mismatches; both controls mismatch (wrong seed: 607,902 bits; CX to CZ: 54,731 qubit bits). The first attempt stopped on a missing `--scratch` directory (script bug, now created by the script; log kept) |
+| pytest, fresh export of the tree with only the wheel installed | Python 3.12 (no kickmix): 11 passed; 3.13 (with kickmix): 11 passed; with no C++ compiler: 10 passed, 1 skipped with a message |
+| wheel / sdist build | maturin `--release --locked`: builds cleanly (wheel .so sha256 7575e4d6...) |
+Timings in these runs are not benchmarks (load average 6-17 from parallel work): cross-check engine/official 5.6/8.6 s
+(DQI vs fork, 10 threads/workers), 4.6/35.7 s (DQI vs 1.0.0 at 6 workers), 35.0/55.5 s and 31.1/132.3 s (invsqrt
+sample vs fork and 1.0.0).
+
+## Still open
+- The release table is for 0.2.0 wheels on one Mac; it was not re-measured for 0.3.0 (only compile changed).
+- invsqrt checks still run in NumPy (about 1.6-1.8x the fork); no Linux or Kaggle numbers in the README.
+- `cargo clippy` reports 22 style warnings in older code (indexing loops, manual slice copies); none are correctness
+  issues and none were changed in this pass, to avoid touching the proven hot paths.

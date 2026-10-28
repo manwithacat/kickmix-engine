@@ -1,16 +1,16 @@
 """Gate 2: single-core time per 256-shot batch, engine vs kickmix `do` (counting on), alternating runs.
-Run with the kickmix interpreter. Usage: single_core.py OUT.json [--rounds N] [--batches B]"""
-import argparse, importlib.util, json, os, subprocess, sys, time
+Run with the kickmix interpreter. Usage: single_core.py OUT.json --kmb invsqrt.kmb [--verifier PATH] [--rounds N]
+[--batches B]. Verifier default: $KICKMIX_ENGINE_INVSQRT_VERIFIER or $KICKMIX_ENGINE_VERIFIERS/invsqrt/..."""
+import argparse, json, os, subprocess, sys, time
 import numpy as np
 import kickmix as km
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "python"))
 import kickmix_engine as ke
-ROOT = '/Volumes/SSD/Kaggle/competitions/google-verifiable-quantum-circuit-compilation'
-spec_ = importlib.util.spec_from_file_location('vinv', ROOT + '/data/official_full/verifiers/invsqrt/verify_submission_invsqrt.py')
-v = importlib.util.module_from_spec(spec_); sys.modules['vinv'] = v; spec_.loader.exec_module(v)
+from kickmix_engine.invsqrt import load_verifier
 ap = argparse.ArgumentParser(); ap.add_argument('out'); ap.add_argument('--rounds', type=int, default=8)
-ap.add_argument('--batches', type=int, default=256); a = ap.parse_args()
-c = km.Circuit.from_file(ROOT + '/outputs/kickmix-popfast-2026-10-27/v3sub/invsqrt.kmb', format='kmb')
+ap.add_argument('--batches', type=int, default=256); ap.add_argument('--kmb', required=True)
+ap.add_argument('--verifier', default=None); a = ap.parse_args()
+v = load_verifier(a.verifier)
+c = km.Circuit.from_file(a.kmb, format='kmb')
 sp = v.ProblemSpecInvSqrt.for_n_p(10)
 x_reg, scratch = v.validate_registers(c, sp)
 prog = ke.compile_circuit(c)

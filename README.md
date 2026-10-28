@@ -1,120 +1,211 @@
 # kickmix-engine
 
-A bit-sliced CPU simulator for [kickmix](https://github.com/quantumlib/Qualtran/tree/main/kickmix) circuits that
-reproduces kickmix shot for shot, and a `kickmix-engine verify` command that runs the official verifiers of the
-Google Quantum AI *Verifiable Quantum Circuit Compilation* (VQCC) competition for the **invsqrt** and **DQI** tasks
-with this engine as the simulator. It reports the same summary fields as the official verifier, and
-`--cross-check` runs the official verifier as well and compares the two.
+kickmix-engine is a CPU simulator for [kickmix](https://github.com/quantumlib/Qualtran/tree/main/kickmix) circuits,
+written in Rust, plus a `kickmix-engine verify` command for the **invsqrt** and **DQI** tasks of the Kaggle competition
+[Google Quantum AI: Verifiable Quantum Circuit Compilation](https://www.kaggle.com/competitions/google-verifiable-quantum-circuit-compilation)
+(VQCC). It is an independent re-implementation of kickmix's simulation semantics. It has been checked shot for shot
+against kickmix: every qubit, every classical bit, the exact phase and the operation counts. `verify` runs the
+competition's official verifier logic with this engine as the simulator and prints the same summary JSON. With
+`--cross-check` it also runs the official verifier and compares every field.
 
-It is not affiliated with or endorsed by Google. The official verifier on kickmix is the reference. This engine is a
-faster way to get the same answer, and it can check itself against that reference whenever you want.
+**Not affiliated with Google, Qualtran or Kaggle.** The official verifier running on kickmix is the reference.
+This engine gets the same answer with less memory and in less time, and it can check itself against the reference
+whenever you ask it to.
 
-**AI assistance.** The code, tests and this README were written by an AI model (Claude, by Anthropic) under the
-direction of the repository owner, James Barlow, who reviews it and is responsible for it. See [NOTICE](NOTICE).
+**Who wrote it.** The code, tests and documentation were written by an AI model (Claude, by Anthropic) under the
+direction of the repository owner, James Barlow, who reviews the work and is responsible for it. See [NOTICE](NOTICE).
+
+## Install
+
+Requirements: Python 3.12 or later on macOS arm64 or Linux x86_64. NumPy is installed as a dependency.
+
+```sh
+# Wheels are attached to each GitHub release (abi3: one wheel per platform serves every Python >= 3.12).
+pip install https://github.com/manwithacat/kickmix-engine/releases/download/v0.3.0/kickmix_engine-0.3.0-cp312-abi3-macosx_11_0_arm64.whl
+pip install https://github.com/manwithacat/kickmix-engine/releases/download/v0.3.0/kickmix_engine-0.3.0-cp312-abi3-manylinux_2_28_x86_64.whl
+
+# kickmix must also be importable: the official verifier modules import it, even though the engine never uses it to simulate.
+pip install kickmix   # kickmix 1.0.0 from PyPI, or the faster fork below
+```
+
+Each release has a `SHA256SUMS.txt`. For kickmix you can use the PyPI package (the official build) or the
+[kickmix-macos](https://github.com/manwithacat/kickmix-macos) fork, an openly AI-assisted fork by the same owner. The
+benchmarks below compare against both.
+
+Building from source needs Rust 1.80 or later:
+
+```sh
+pip install maturin && maturin build --release --locked -o dist && pip install dist/*.whl
+# For an in-place development build on macOS: ./build.sh, then put python/ on PYTHONPATH.
+```
+
+## What you need besides the package
+
+- **The official verifiers.** `verify_submission_dqi.py` and `verify_submission_invsqrt.py` ship in the `verifiers/`
+  directory of the competition data. Download them from the competition's Data tab, or with
+  `kaggle competitions download -c google-verifiable-quantum-circuit-compilation` once you have accepted the rules.
+  They are not redistributed here. Point the engine at that directory:
+  `export KICKMIX_ENGINE_VERIFIERS=/path/to/verifiers` (it must contain `dqi/` and `invsqrt/`).
+- **Circuits to verify.** Use your own `.kmb` files, the competition's `sample_submission/`, or the public Kaggle
+  dataset [manwithacat/vqcc-apache-public-circuits](https://www.kaggle.com/datasets/manwithacat/vqcc-apache-public-circuits).
+  That dataset collects circuits published in Apache-2.0 notebooks, including the two DQI circuits used below
+  (`dqi/4ee7a17b4cbc.kmb`, `dqi/b3354f60e459.kmb`) and `invsqrt/07314803a092.kmb`.
 
 ## Quickstart
 
-Requirements: Python 3.12 or later, NumPy, and **kickmix importable in the same interpreter**. The engine does not
-use kickmix to simulate, but the official verifier module imports it, and the engine takes seeds, input sampling
-rules, statistics and scoring from that module. You also need the competition's official verifier files (the
-`verifiers/` directory of the competition data).
-
-```sh
-pip install kickmix_engine-0.2.0-cp312-abi3-<platform>.whl     # a wheel from the GitHub Actions build or release
-export KICKMIX_ENGINE_VERIFIERS=/path/to/competition/verifiers  # contains dqi/ and invsqrt/
-
-kickmix-engine verify dqi dqi.kmb --threads 10                  # prints the official summary JSON
-kickmix-engine verify dqi dqi.kmb --salt salt-check-1 --cross-check --official-workers 4
-kickmix-engine verify invsqrt invsqrt.kmb --threads 10 --cross-check
-kickmix-engine cache info                                       # compiled-program cache (see below)
-```
-
-Exit codes: 0 PASS; 1 FAIL (`{"status": "FAIL", "error": ...}`, as the official CLI); 3 when `--cross-check` finds a
-difference. `--timing` prints engine timing and cache events to stderr. `python -m kickmix_engine` works as well.
-
-Build from source (Rust 1.80 or later):
-
-```sh
-pip install maturin && maturin build --release -o dist && pip install dist/*.whl
-# or, for an in-place development build on macOS:  ./build.sh  (then put python/ on PYTHONPATH)
-pip install pytest && pytest tests/test_engine.py   # needs neither kickmix nor the competition files
-```
-
-## What it does
-
-- **Simulator** (`src/sim.rs`, `src/engine.rs`): 256 shots per word group (four 64-bit words per qubit or bit),
-  using kickmix's semantics: condition stack, 128-bit fixed-point angles, global phase, HMR/R outcomes from kickmix's
-  random-number chain (std::seed_seq, then mt19937_64, then ChaCha8 keys per 256-shot simulator), and exact
-  per-kind operation counts. Batches run in parallel with Rayon. The GIL is released while they run.
-- **Compiler** (`src/program.rs`): reads `.kmb` files directly into a u32 word stream with compacted classical-bit
-  ids and runs of plain CX ops.
-- **Program cache** (`python/kickmix_engine/cache.py`): compiled programs are stored on disk, keyed by the SHA-256 of
-  the circuit file plus the engine build (crate version, cache format, extension hash). Writes are atomic
-  (temporary file then rename), so concurrent runs are safe. Files are checksummed and bounds-checked when loaded,
-  and any file that fails is treated as a miss. Location: `--cache-dir`, `$KICKMIX_ENGINE_CACHE`, or
-  `~/.cache/kickmix-engine`. A DQI program takes about 257 MiB. `kickmix-engine cache prune` removes entries from other
-  builds.
-- **DQI input sampler** (`src/dqi_sample.rs`): an exact re-implementation of the verifier's `sample_shots`. It follows
-  NumPy's PCG64 stream draw for draw, including the 32-bit half-word buffer, the Lemire bounded integers, Floyd
-  sampling with a shuffle for `choice(replace=False)`, and the CDF search for `choice(p=...)`. Generator start states
-  come from NumPy itself. It runs fused with the simulation, so no inputs pass through Python.
-  `--sampler official` uses the verifier's own `sample_shots` instead (the reference path). `--self-check K`
-  re-draws K batches (or all of them, with -1) with the official function and fails on any difference.
-- **Task adapters** (`dqi.py`, `invsqrt.py`): seeds, task layout, reference tables, Clopper-Pearson bound, repetition
-  factor and cost model all come from the official verifier module, unchanged.
-
-Differences from the official output: `reaction_depth` is `null`, because it is not computed. The circuit hash is the
-SHA-256 of the file bytes, while the official verifier hashes kickmix's re-serialisation of the circuit. These are
-equal for canonical `.kmb` files, and `--cross-check` compares them on every run. Only `.kmb` input and
-`batch_size=256` are supported. On FAIL the engine reports the first failure in task order, using the official
-message text.
-
-## Verify our claims
-
-These results come from the development Mac (Apple M2 Pro, 6 performance and 4 efficiency cores). The oracle is the
-unmodified official verifier on a kickmix build. Each command writes a JSON report and refuses to overwrite one.
-Circuits: DQI `4ee7a17b4cbc…` (889 qubits, 55.8M ops; from the public Kaggle notebook "The dataset is now public now.
-Enjoy!" by Heliosli) and `b3354f60e459…` (897 qubits; from "Quantum Circuits | 22.44 Local GM: Our Chemistry" by Agniv
-Banerjee). Both notebooks are released under Apache-2.0, and the circuits are collected in the *VQCC public circuits*
-Kaggle dataset. The invsqrt check uses the competition's `sample_submission/invsqrt.kmb`.
-
 ```sh
 export KICKMIX_ENGINE_VERIFIERS=/path/to/verifiers
-# 0. Kickmix-free unit and parity tests (also run in CI)
-pytest tests/test_engine.py
-# 1. Gate 1, per-shot parity on DQI: every qubit, classical bit, exact phase, verifier flags and op counts against
-#    kickmix on verifier chunks and random seeds, plus negative controls (wrong seed, one flipped op).
-#    The chunks holding the logged failing shots of these circuits (from salt checks run on Kaggle) are in
-#    tests/data/dqi_logged_failing_shots.jsonl and are included by default.
-python tests/parity_dqi.py g1.json --kmb 4ee7a17b4cbc.kmb --kmb b3354f60e459.kmb --scratch /tmp/g1
-#    invsqrt: per-shot parity (qubits, bits, exact 128-bit phase, 2^-64-turn units, op and Z_POW-level counts)
-python tests/parity.py g1_invsqrt.json --kmb invsqrt.kmb
-# 2. Sampler proof: the engine sampler against the official sample_shots on all 400 batches x 3 salts,
-#    values plus the PCG64 state after each batch
-python tests/sampler_parity_dqi.py sampler.json --kmb 4ee7a17b4cbc.kmb --kmb b3354f60e459.kmb
-# 2. Gate 2, task parity: full 102,400-shot verification at '', salt-check-1, salt-check-2, compared with the
-#    official verify() field by field and for each of the 400 batches
-python tests/task_parity_dqi.py g2.json --kmb 4ee7a17b4cbc.kmb --kmb b3354f60e459.kmb
-# Any circuit, any salt: the CLI's cross-check against the official verifier CLI
-kickmix-engine verify dqi your.kmb --salt anything --cross-check
-kickmix-engine verify invsqrt your.kmb --cross-check
+
+kickmix-engine verify dqi circuits/dqi/4ee7a17b4cbc.kmb                    # prints the official summary JSON
+kickmix-engine verify dqi circuits/dqi/4ee7a17b4cbc.kmb --salt my-salt --cross-check --official-workers 4
+kickmix-engine verify invsqrt sample_submission/invsqrt.kmb --cross-check
 ```
 
-Recorded outcomes (2026-10-28):
+From Python:
+
+```python
+from kickmix_engine.dqi import DQITask
+summary = DQITask("4ee7a17b4cbc.kmb").verify(salt="", threads=8)   # the official verify() fields
+```
+
+## The `verify` command
+
+```
+kickmix-engine verify {dqi,invsqrt} CIRCUIT.kmb [--salt S] [--seed N] [--threads N] [--cross-check] [options]
+kickmix-engine cache {info,prune,clear} [--cache-dir DIR]
+python -m kickmix_engine ...    # same thing
+```
+
+- Output: the official verifier's summary fields, with the same names and values, including `reaction_depth` and
+  `circuit_sha256`. On failure it prints `{"status": "FAIL", "error": ...}` with the official message text, as the
+  official CLI does.
+- Exit codes: 0 PASS; 1 FAIL; 3 when `--cross-check` finds any difference.
+- `--cross-check` also runs the official verifier CLI, unchanged, in `--official-python` (default: the same
+  interpreter), with `--official-workers` processes (default: the verifier's own default). It prints
+  `{"match": bool, "differences": {...}, "engine": {...}, "official": {...}, "seconds": {...}}`. Every field is
+  compared, on PASS and on FAIL.
+- The task options mirror the official CLI's: `--m --n --degree --r --num-shots --log2-delta` for DQI, and
+  `--n-p --beta --precision-bits --shots-per-x --eta --width --max-x --system-qubits` for invsqrt.
+- `--verifier PATH` selects one verifier file. If it is not given, the engine uses `$KICKMIX_ENGINE_DQI_VERIFIER` or
+  `$KICKMIX_ENGINE_INVSQRT_VERIFIER`, and then `$KICKMIX_ENGINE_VERIFIERS/{dqi,invsqrt}/verify_submission_*.py`.
+- DQI input sampling: `--sampler engine` (the default) draws the inputs in Rust, reproducing the verifier's
+  `sample_shots` draw for draw from NumPy's PCG64 stream. `--sampler official` calls the verifier's own `sample_shots`.
+  `--self-check K` re-draws K batches (or all of them, with -1) with the official function and fails on any difference.
+- Compiled programs are cached on disk, keyed by the SHA-256 of the circuit file and the engine build. The cache lives
+  in `--cache-dir`, `$KICKMIX_ENGINE_CACHE`, `$XDG_CACHE_HOME/kickmix-engine` or `~/.cache/kickmix-engine`, and
+  `--no-cache` turns it off. A DQI program takes about 257 MiB. `cache prune` removes entries written by other builds.
+- `--timing` prints engine timings and cache events to stderr.
+
+## Measured results
+
+Full DQI verification of `4ee7a17b4cbc` (889 qubits, 55.8M ops, 102,400 shots, empty salt) on an Apple M2 Pro (6
+performance + 4 efficiency cores). Engine 0.2.0 wheel built by GitHub Actions, against the official verifier CLI on
+kickmix 1.0.0 (PyPI) and on the kickmix-macos 0.3.0 fork, each in a clean Python 3.13 venv. Medians of alternating
+rounds (3 against the fork, 2 against 1.0.0). "Cold" includes compiling the circuit; "warm" loads it from the program
+cache. All 34 runs returned the identical result (PASS, 0 value and 0 phase errors, R 1.19126, score
+414781342770.7355).
+
+| baseline | workers / threads | baseline time | engine cold | engine warm | speed-up warm (cold) | peak memory, baseline / engine |
+| --- | --- | --- | --- | --- | --- | --- |
+| kickmix-macos 0.3.0 | 1 | 49.5 s | 31.7 s | 30.7 s | 1.61x (1.56x) | 2,091 / 339-352 MiB |
+| kickmix-macos 0.3.0 | 10 | 8.9 s | 5.7 s | 4.7 s | 1.89x (1.56x) | 8,251 / 417-418 MiB |
+| kickmix 1.0.0 | 1 | 189.7 s | 32.3 s | 31.5 s | 6.0x (5.9x) | 8,073 / 340-344 MiB |
+| kickmix 1.0.0 | 6 | 36.7 s | 6.8 s | 5.9 s | 6.2x (5.4x) | 9,211 / 388-389 MiB |
+
+Caveats: one machine, one circuit, one salt. The machine was not idle (load average 3.0-7.4 from other work, recorded
+per run), but the ratios held steady across the alternating rounds. Peak memory is the whole process tree's peak
+physical footprint. The engine's single process is set against the verifier's worker processes, which is how each one
+is meant to run. These numbers are for engine 0.2.0. Version 0.3.0 changes only the one-off compile step, which now
+also computes `reaction_depth` (1.13 s for this circuit, measured locally, against 1.17 s for 0.2.0), so the table
+was not re-measured. invsqrt is less accelerated: about 1.8x the fork at 10 threads on the sample submission
+(31.5 s against 56.2 s, a single smoke run), because its per-shot checks still run in NumPy.
+
+Parity record (all on the circuits named above; the oracle is the unmodified official verifier on kickmix):
 
 | check | result |
 | --- | --- |
-| DQI per-shot parity | 17 verifier chunks + 6 random chunks, 5,888 shots: 0 mismatches; both negative controls mismatch |
-| invsqrt per-shot parity | 7 verifier chunks + random multi-sim chunks: 0 mismatches; wrong-seed control mismatches |
-| sampler | 2,400 batches (2 circuits x 3 salts x 400): syndromes, MBUC values, phases, bit-sliced rows and end generator state all identical; controls mismatch |
-| DQI task parity | 2 circuits x 3 salts: every summary field (except `reaction_depth`) and all 400 per-batch results identical; scores 414781342770.7355 / 414781480388.3637 / 414780974766.7814 and 422346240055.8793 / 422346307712.4221 / 424285910872.26764 |
-| invsqrt (sample submission) | `--cross-check`: all fields identical, score 2076774.233715282 |
+| DQI per-shot parity | 2 circuits, 17 verifier batches + 6 random ones, 5,888 shots: 0 mismatches in all qubits, classical bits, exact phase, error flags and op counts. Both negative controls (wrong seed, one CX changed to CZ) mismatch |
+| invsqrt per-shot parity | 7 verifier chunks + random multi-simulator chunks: 0 mismatches; the wrong-seed control mismatches |
+| DQI sampler | 2 circuits x 3 salts x 400 batches: inputs, phases and the generator state after every batch identical to the official `sample_shots` |
+| DQI task parity | 2 circuits x 3 salts: every summary field and all 400 per-batch results identical |
+| `reaction_depth` | equal to kickmix's `Circuit.reaction_depth()` on both DQI circuits, two invsqrt circuits and thousands of random circuits covering every op kind |
+| FAIL paths | dirty ancilla, syndrome not restored, x not restored, dirty scratch, error-rate and phase-tolerance failures: same status and message as the official verifier |
 
-Speed and memory against the kickmix fork are measured separately (see the project report). The release numbers are
-to be taken with the published wheels.
+## Reproduce the parity claims
+
+The scripts in `tests/` need kickmix and the official verifiers (set `KICKMIX_ENGINE_VERIFIERS`). They write a JSON
+report, refuse to overwrite an existing one, and exit non-zero on any mismatch. Run them from the repository root with
+`kickmix_engine` installed (or `PYTHONPATH=python` after `./build.sh`).
+
+```sh
+export KICKMIX_ENGINE_VERIFIERS=/path/to/verifiers
+C=/path/to/vqcc-apache-public-circuits/circuits      # the public dataset
+
+# DQI per-shot parity (verifier batches incl. logged failing shots from tests/data, random batches, negative controls).
+# --scratch receives a 0.5 GB mutated copy for the CX->CZ control; delete it afterwards.
+python tests/parity_dqi.py g1.json --kmb $C/dqi/4ee7a17b4cbc.kmb --kmb $C/dqi/b3354f60e459.kmb --scratch ./scratch
+# invsqrt per-shot parity
+python tests/parity.py g1_invsqrt.json --kmb /path/to/sample_submission/invsqrt.kmb
+# DQI sampler against the official sample_shots, all batches, three salts
+python tests/sampler_parity_dqi.py sampler.json --kmb $C/dqi/4ee7a17b4cbc.kmb --kmb $C/dqi/b3354f60e459.kmb
+# DQI task parity: full verification against the official verify(), field by field and per batch
+python tests/task_parity_dqi.py g2.json --kmb $C/dqi/4ee7a17b4cbc.kmb --kmb $C/dqi/b3354f60e459.kmb
+# reaction_depth against kickmix: random circuits plus real ones
+python tests/reaction_depth_parity.py rd.json --random 2000 --kmb $C/dqi/4ee7a17b4cbc.kmb --kmb $C/invsqrt/07314803a092.kmb
+# FAIL paths: small mutated circuits built from the official reference circuits, through --cross-check
+python tests/fail_paths_crosscheck.py fail.json --scratch ./scratch
+# Any circuit, any salt
+kickmix-engine verify dqi your.kmb --salt anything --cross-check
+```
+
+## Tests
+
+```sh
+pip install pytest
+pytest            # from the repository root; needs only the installed wheel (no kickmix, no competition files)
+```
+
+`tests/test_engine.py` checks the simulator against a stored kickmix reference for a random circuit over every op
+kind. It also covers the program cache (round trip and corruption detection), `reaction_depth` against stored kickmix
+values, and the DQI sampler against a NumPy restatement of `sample_shots`. `tests/test_rng.py` compares the random
+number chain with a stored reference and, when a C++ compiler is available (`$CXX` or `c++`), with
+`tests/chachakeys.cc` built on the spot. Otherwise that test is skipped. The fixtures in `tests/data` were produced
+with kickmix by `tests/make_fixtures.py` and `tests/reaction_depth_parity.py`. The bench scripts in `bench/` take
+their inputs as arguments (`--kmb`, `--verifier`) or environment variables (`FORK_PY`, `ENGINE_PY`, `VERIFIER`, `KMB`,
+`EVIDENCE`), as each script's header documents.
+
+## How it works
+
+- **Simulator** (`src/sim.rs`, `src/engine.rs`): 256 shots per group of four 64-bit words per qubit or bit. It follows
+  kickmix's semantics: condition stack, 128-bit fixed-point angles, global phase, HMR/R outcomes from kickmix's random
+  number chain (std::seed_seq, mt19937_64, then ChaCha8 keys per 256-shot simulator) and exact per-kind operation
+  counts. Batches run in parallel with Rayon, and the GIL is released while they run.
+- **Compiler** (`src/program.rs`): streams a `.kmb` file into a compact u32 instruction stream, with compacted
+  classical-bit ids and runs of plain CX. In the same pass it computes kickmix's `reaction_depth`, which is stored
+  with the cached program.
+- **DQI sampler** (`src/dqi_sample.rs`): an exact re-implementation of the verifier's `sample_shots` on NumPy's PCG64
+  stream, fused with the simulation.
+- **Task adapters** (`python/kickmix_engine/dqi.py`, `invsqrt.py`): load the official verifier module and use its
+  seeds, problem spec, reference tables, Clopper-Pearson bound, repetition factor and cost model unchanged.
+
+## Limitations
+
+- Only the invsqrt and DQI tasks. Chemistry (`dfthcsos`) is not supported.
+- Only `.kmb` input and `--batch-size 256`. DEBUG_PRINT ops are rejected. Qubit ids must be below 65,536.
+- kickmix must be importable, because the official verifier modules import it.
+- `circuit_sha256` is the SHA-256 of the file bytes. The official verifier hashes kickmix's re-serialisation of the
+  circuit. The two are equal for canonical `.kmb` files (as written by kickmix), and `--cross-check` compares them on
+  every run. A non-canonical file would get different seeds, and the cross-check would report it.
+- On FAIL the engine reports the first failure in task order, as the official verifier does. That has been checked on
+  the FAIL cases listed above, not on every possible failure.
+- Wheels are built for macOS arm64 and Linux x86_64 only. Big-endian hosts are not supported (cache format).
+- The speed and memory figures come from one Apple Silicon machine. They have not been measured on Linux or on
+  Kaggle.
 
 ## Licence
 
-Apache-2.0 (see [LICENSE](LICENSE)). The simulation semantics and random-number chain follow kickmix (Copyright
-Google LLC, Apache-2.0). The DQI sampler follows NumPy's random-number algorithms (BSD-3-Clause). The test file
-restates the official verifier's `sample_shots` (Apache-2.0, Google LLC). Details are in [NOTICE](NOTICE).
+Apache-2.0 (see [LICENSE](LICENSE)). The simulation semantics, the random-number chain and the `reaction_depth`
+definition follow kickmix (Copyright Google LLC, Apache-2.0). The task adapters call the official verifiers (Copyright
+Google LLC, Apache-2.0), which are not included. The DQI sampler reproduces NumPy's random-number algorithms
+(BSD-3-Clause), without NumPy source code. Details are in [NOTICE](NOTICE), and changes are listed in
+[CHANGELOG.md](CHANGELOG.md).

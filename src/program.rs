@@ -110,6 +110,8 @@ pub struct Program {
     pub n_info_tags: u64,
     pub max_stack_depth: usize,
     pub n_cx_runs: usize,
+    /// kickmix `Circuit.reaction_depth()`, computed once while compiling (see `ReactionDepth`).
+    pub reaction_depth: u64,
     /// Static per-kind op counts (as `circuit.operation_statistics()`), count slots.
     pub static_counts: [u64; NCOUNT],
     /// Registers from the .kmb file: (name, [(is_qubit, id)]).
@@ -133,6 +135,220 @@ pub struct Builder {
     depth: usize,
     max_depth: usize,
     static_counts: [u64; NCOUNT],
+    rd: ReactionDepth,
+}
+
+/// kickmix's reaction depth (`Circuit::reaction_depth`, `compute_reaction_depth` in kickmix
+/// `circuit/circuit_util.cc`, Apache-2.0, Google LLC), restated as a streaming tracker over source ops in file order.
+/// Per qubit: the reaction depth of knowing whether a bit flip (`x`) or a phase flip (`z`) is present; per classical
+/// bit (`c`, original ids): of knowing its value. Non-Clifford ops (CCX, CCZ, CSWAP, non-Clifford Z_POW) add one
+/// layer; HMR makes a bit depend on the qubit's `z` depth plus one; ops under the condition stack or a bit condition
+/// inherit the condition's depth. The result is the maximum over all entries. Every rule below mirrors the kickmix
+/// switch case for case, including the order of the bumps (later bumps read values updated by earlier ones).
+/// INFO_TAG, NEG and DEBUG_PRINT have no effect, so INFO_TAG (not in the engine stream) is skipped.
+pub struct ReactionDepth {
+    x: Vec<u64>,
+    z: Vec<u64>,
+    c: Vec<u64>,
+    stack: Vec<u64>,
+}
+
+impl ReactionDepth {
+    pub fn new() -> Self {
+        // Qubit ids are < 65536 (checked by `Builder::op`), so the qubit tables never grow.
+        ReactionDepth { x: vec![0; 1 << 16], z: vec![0; 1 << 16], c: Vec::new(), stack: vec![0] }
+    }
+
+    /// Fast path for the commonest op, a CX with no bit condition (same rule as the CX case of `apply`).
+    #[inline(always)]
+    pub fn cx_plain(&mut self, c1: u32, t: u32) {
+        let (c1, t) = (c1 as usize & 0xFFFF, t as usize & 0xFFFF);
+        let cd = *self.stack.last().unwrap();
+        let xt = self.x[t].max(cd).max(self.x[c1]);
+        self.x[t] = xt;
+        let zc = self.z[c1].max(cd).max(self.z[t]);
+        self.z[c1] = zc;
+    }
+    #[inline]
+    fn grow_c(&mut self, b: usize) {
+        if b >= self.c.len() {
+            let n = (b + 1).max(self.c.len() * 2).max(64);
+            self.c.resize(n, 0);
+        }
+    }
+    #[inline]
+    fn xb(&mut self, q: usize, d: u64) {
+        if d > self.x[q] {
+            self.x[q] = d;
+        }
+    }
+    #[inline]
+    fn zb(&mut self, q: usize, d: u64) {
+        if d > self.z[q] {
+            self.z[q] = d;
+        }
+    }
+    #[inline]
+    fn cbump(&mut self, b: usize, d: u64) {
+        if d > self.c[b] {
+            self.c[b] = d;
+        }
+    }
+
+    /// One source op (base kind, condition bit, qubits, bit target, Z_POW angle), original bit ids.
+    pub fn apply(&mut self, kind: u8, cond: Option<u32>, qs: &[u32], bit: Option<u32>, angle: Option<u128>) {
+        if let Some(b) = bit {
+            self.grow_c(b as usize);
+        }
+        if let Some(b) = cond {
+            self.grow_c(b as usize);
+        }
+        let mut cd = *self.stack.last().unwrap();
+        if let Some(b) = cond {
+            cd = cd.max(self.c[b as usize]);
+        }
+        // kickmix: `condition_depth_stack.size() == 1 && !op.c_condition.is_bit()`.
+        let top = self.stack.len() == 1 && cond.is_none();
+        // Operand order as kickmix `Circuit::iter_ops` assigns it: 2-qubit ops are (control1, target), 3-qubit ops
+        // (control2, control1, target), i.e. the target is the last operand.
+        let q = |i: usize| qs[i] as usize;
+        match kind {
+            K_NEG => {}
+            K_X => self.xb(q(0), cd),
+            K_Z => self.zb(q(0), cd),
+            K_INV => self.cbump(bit.unwrap() as usize, cd),
+            K_ST0 | K_ST1 => {
+                let b = bit.unwrap() as usize;
+                if top {
+                    self.c[b] = 0;
+                } else {
+                    self.cbump(b, cd);
+                }
+            }
+            K_CX => {
+                let (c1, t) = (q(0), q(1));
+                self.xb(t, cd);
+                self.xb(t, self.x[c1]);
+                self.zb(c1, cd);
+                self.zb(c1, self.z[t]);
+            }
+            K_CZ => {
+                let (c1, t) = (q(0), q(1));
+                self.zb(t, cd);
+                self.zb(t, self.x[c1]);
+                self.zb(c1, cd);
+                self.zb(c1, self.x[t]);
+            }
+            K_SWAP => {
+                let (c1, t) = (q(0), q(1));
+                if top {
+                    self.x.swap(t, c1);
+                    self.z.swap(t, c1);
+                } else {
+                    self.xb(t, self.x[c1]);
+                    self.zb(t, self.z[c1]);
+                    self.xb(c1, self.x[t]);
+                    self.zb(c1, self.z[t]);
+                    self.zb(t, cd);
+                    self.xb(t, cd);
+                    self.zb(c1, cd);
+                    self.xb(c1, cd);
+                }
+            }
+            K_R => {
+                let t = q(0);
+                if top {
+                    self.x[t] = 0;
+                    self.z[t] = 0;
+                } else {
+                    self.xb(t, cd);
+                }
+            }
+            K_HMR => {
+                let (t, b) = (q(0), bit.unwrap() as usize);
+                if top {
+                    self.c[b] = self.z[t] + 1;
+                    self.x[t] = 0;
+                    self.z[t] = 0;
+                } else {
+                    self.cbump(b, cd);
+                    self.cbump(b, self.z[t] + 1);
+                    self.xb(t, cd);
+                    self.zb(t, cd);
+                }
+            }
+            K_CCX => {
+                let (c2, c1, t) = (q(0), q(1), q(2));
+                self.xb(t, cd + 1);
+                self.xb(t, self.x[c1] + 1);
+                self.xb(t, self.x[c2] + 1);
+                self.zb(c1, cd + 1);
+                self.zb(c1, self.z[t] + 1);
+                self.zb(c1, self.x[c2] + 1);
+                self.zb(c2, cd + 1);
+                self.zb(c2, self.z[t] + 1);
+                self.zb(c2, self.x[c1] + 1);
+            }
+            K_CSWAP => {
+                let (c2, c1, t) = (q(0), q(1), q(2));
+                let dx = self.x[t].max(self.x[c1]);
+                let dz = self.z[t].max(self.z[c1]);
+                let dxc = self.x[c2];
+                for &u in &[t, c1] {
+                    self.xb(u, cd + 1);
+                    self.xb(u, dx + 1);
+                    self.xb(u, dxc + 1);
+                }
+                for &u in &[t, c1] {
+                    self.zb(u, cd + 1);
+                    self.zb(u, dz + 1);
+                    self.zb(u, dxc + 1);
+                }
+                self.zb(c2, cd + 1);
+                self.zb(c2, dx + 1);
+                self.zb(c2, dz + 1);
+            }
+            K_ZPOW => {
+                let t = q(0);
+                // FixedPrecisionAngle128::is_multiple_of_180_degrees: only the top bit of V may be set.
+                if angle.unwrap() & !(1u128 << 127) == 0 {
+                    self.zb(t, cd);
+                } else {
+                    self.zb(t, cd + 1);
+                    self.zb(t, self.x[t] + 1);
+                }
+            }
+            K_CCZ => {
+                let (c2, c1, t) = (q(0), q(1), q(2));
+                self.zb(t, cd + 1);
+                self.zb(t, self.x[c1] + 1);
+                self.zb(t, self.x[c2] + 1);
+                self.zb(c1, cd + 1);
+                self.zb(c1, self.x[t] + 1);
+                self.zb(c1, self.x[c2] + 1);
+                self.zb(c2, cd + 1);
+                self.zb(c2, self.x[t] + 1);
+                self.zb(c2, self.x[c1] + 1);
+            }
+            K_PUSH => self.stack.push(cd),
+            K_POP => {
+                if self.stack.len() > 1 {
+                    self.stack.pop();
+                }
+            }
+            _ => unreachable!("reaction depth: unhandled kind {}", kind),
+        }
+    }
+
+    pub fn max_depth(&self) -> u64 {
+        self.x.iter().chain(self.z.iter()).chain(self.c.iter()).copied().max().unwrap_or(0)
+    }
+}
+
+impl Default for ReactionDepth {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 pub fn angle_level(v: u128) -> u8 {
@@ -166,6 +382,7 @@ impl Builder {
             depth: 0,
             max_depth: 0,
             static_counts: [0; NCOUNT],
+            rd: ReactionDepth::new(),
         }
     }
 
@@ -227,6 +444,11 @@ impl Builder {
         }
         self.n_source_ops += 1;
         self.static_counts[kind as usize] += 1;
+        if kind == K_CX && cond.is_none() {
+            self.rd.cx_plain(qs[0], qs[1]);
+        } else {
+            self.rd.apply(kind, cond, qs, bit, angle);
+        }
         match kind {
             K_PUSH => {
                 self.depth += 1;
@@ -296,6 +518,7 @@ impl Builder {
             n_info_tags: self.n_info,
             max_stack_depth: self.max_depth,
             n_cx_runs: self.n_runs,
+            reaction_depth: self.rd.max_depth(),
             static_counts: self.static_counts,
             registers,
         }
@@ -576,8 +799,8 @@ impl Program {
 // checksum over everything before it. The Python cache layer keys files by circuit SHA-256 + engine build.
 
 pub const CACHE_MAGIC: &[u8; 8] = b"KMXEPRG\0";
-/// Bump whenever the IR or this layout changes.
-pub const CACHE_FORMAT: u32 = 1;
+/// Bump whenever the IR or this layout changes. Format 2 (0.3.0) adds `reaction_depth` as a ninth scalar field.
+pub const CACHE_FORMAT: u32 = 2;
 
 /// Streaming 64-bit checksum (4 multiply-rotate lanes over 8-byte words; independent of how the bytes are split
 /// into calls). Detects truncation and corruption; it is not a cryptographic hash.
@@ -661,7 +884,7 @@ impl Program {
         head.extend_from_slice(CACHE_MAGIC);
         head.extend_from_slice(&CACHE_FORMAT.to_le_bytes());
         for v in [self.num_qubits, self.num_bits, self.orig_num_bits, self.nrand, self.n_source_ops, self.n_info_tags as usize,
-                  self.max_stack_depth, self.n_cx_runs] {
+                  self.max_stack_depth, self.n_cx_runs, self.reaction_depth as usize] {
             head.extend_from_slice(&(v as u64).to_le_bytes());
         }
         for v in self.static_counts {
@@ -718,7 +941,7 @@ impl Program {
             return Err("not a program cache file of this format version".into());
         }
         let mut sc = [0u64; 9];
-        for v in sc.iter_mut().take(8) {
+        for v in sc.iter_mut() {
             *v = u64s(&mut r, &mut take, &mut hdr)?;
         }
         let mut static_counts = [0u64; NCOUNT];
@@ -788,6 +1011,7 @@ impl Program {
             n_info_tags: sc[5],
             max_stack_depth: sc[6] as usize,
             n_cx_runs: sc[7] as usize,
+            reaction_depth: sc[8],
             static_counts,
             registers,
         };

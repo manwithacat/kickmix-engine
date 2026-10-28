@@ -1,12 +1,12 @@
 """Context for gate 3: kickmix `do` aggregate throughput with N forked processes (counting on), alternated with the
-engine at N threads on the same inputs, so both see the same background load. Usage: kickmix_scaling.py OUT.json"""
-import json, multiprocessing as mp, os, subprocess, sys, time
+engine at N threads on the same inputs, so both see the same background load.
+Usage: kickmix_scaling.py OUT.json --kmb invsqrt.kmb"""
+import argparse, json, multiprocessing as mp, os, subprocess, sys, time
 import numpy as np
 import kickmix as km
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "python"))
 import kickmix_engine as ke
-ROOT = '/Volumes/SSD/Kaggle/competitions/google-verifiable-quantum-circuit-compilation'
-c = km.Circuit.from_file(ROOT + '/outputs/kickmix-popfast-2026-10-27/v3sub/invsqrt.kmb', format='kmb')
+ap = argparse.ArgumentParser(); ap.add_argument('out'); ap.add_argument('--kmb', required=True); a = ap.parse_args()
+c = km.Circuit.from_file(a.kmb, format='kmb')
 prog = ke.compile_circuit(c)
 B = 1000
 xs = ((np.arange(B * 256, dtype=np.uint64) % np.uint64(3 * 1022**2)) + 1).reshape(B, 256)
@@ -30,4 +30,4 @@ for rnd in range(2):
         te = time.perf_counter() - t0
         out.append(dict(round=rnd, n=n, load=ld, kickmix_shots_per_s=n * B * 256 / tk, engine_shots_per_s=n * B * 256 / te))
         print(out[-1], flush=True)
-json.dump(dict(runs=out, uptime=subprocess.run(['uptime'], capture_output=True, text=True).stdout.strip()), open(sys.argv[1], 'w'), indent=1)
+json.dump(dict(runs=out, uptime=subprocess.run(['uptime'], capture_output=True, text=True).stdout.strip()), open(a.out, 'w'), indent=1)

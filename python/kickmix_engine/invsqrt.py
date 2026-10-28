@@ -9,7 +9,7 @@ batches in order (proven per shot in M1 gate 1). Phases arrive as the verifier's
 - the circuit is compiled from the .kmb file by the engine (no kickmix Circuit);
 - the seed hash is the SHA-256 of the file bytes (the verifier hashes kickmix's re-serialisation; equal for
   canonical .kmb files, which `--cross-check` confirms per run);
-- `reaction_depth` is not computed (None);
+- `reaction_depth` is computed by the engine at compile time (kickmix's definition; cached with the program);
 - only `batch_size=256` is supported;
 - on FAIL, the error reported is the first failure in task order, with the official message text; for a dirty
   scratch qubit the failing chunk is re-run with a state dump to name the qubit as the official message does.
@@ -171,7 +171,7 @@ class InvSqrtTask:
             'rotation_count': n_rot,
             'rotation_eps': eps,
             'num_qubits': prog.num_qubits,
-            'reaction_depth': None,
+            'reaction_depth': int(prog.reaction_depth),
             'num_ops': prog.num_ops,
             'verified_shots': num_shots,
             'worst_error_over_tolerance': worst[0],

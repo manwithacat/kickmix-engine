@@ -12,7 +12,6 @@ import argparse, json, os, sys, time
 import numpy as np
 import kickmix as km
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'python'))
 import kickmix_engine as ke
 from kickmix_engine import dqi
 

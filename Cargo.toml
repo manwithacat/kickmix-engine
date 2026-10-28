@@ -1,9 +1,11 @@
 [package]
 name = "kickmix-engine"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 license = "Apache-2.0"
 description = "Bit-sliced CPU simulator core, per-shot compatible with kickmix"
+repository = "https://github.com/manwithacat/kickmix-engine"
+readme = "README.md"
 
 [lib]
 name = "_engine"

@@ -2,10 +2,13 @@
 
 - random-ops parity against a stored kickmix reference (tests/data, built by tests/make_fixtures.py);
 - program cache: save/load round trip, corruption and truncation detection, cold then warm `load_program`;
+- reaction depth against kickmix's `Circuit.reaction_depth()` on stored random circuits (tests/data, built by
+  tests/reaction_depth_parity.py);
 - the DQI sampler against a NumPy restatement of the official `sample_shots` (for several parameter sets), and the
   PCG64 stream against NumPy's own `random_raw`.
 Written by an AI model (Claude) under the owner's direction.
 """
+import json
 import os
 import shutil
 
@@ -50,7 +53,7 @@ def test_program_save_load_roundtrip(tmp_path):
     q = _engine.Program.load(p)
     for attr in ('num_qubits', 'num_bits', 'num_ops', 'num_stream_ops', 'num_rand', 'bit_map', 'bit_compact',
                  'orig_num_bits', 'num_info_tags', 'max_stack_depth', 'num_cx_runs', 'num_angles', 'static_counts',
-                 'registers'):
+                 'registers', 'reaction_depth'):
         assert getattr(q, attr) == getattr(prog, attr), attr
     raw = bytearray(open(p, 'rb').read())
     bad = bytearray(raw); bad[len(bad) // 2] ^= 0x10
@@ -78,6 +81,29 @@ def test_cache_cold_then_warm(tmp_path):
     with pytest.raises(ValueError):  # the appended byte makes the .kmb invalid, so it must be compiled (and fail)
         load_program(kmb, cache=cache)
     assert len(cache.entries()) == 1
+
+
+def test_reaction_depth_matches_kickmix_reference():
+    with open(os.path.join(DATA, 'reaction_depth_ref.json')) as f:
+        ref = json.load(f)
+    assert len(ref['circuits']) >= 20
+    depths = set()
+    for c in ref['circuits']:
+        prog = ke.compile_text(c['text'], c['num_qubits'])
+        assert prog.reaction_depth == c['reaction_depth'], c['text'][:200]
+        depths.add(c['reaction_depth'])
+    assert len(depths) > 5  # the fixture is not degenerate
+
+
+def test_reaction_depth_small_cases():
+    # kickmix docstring example, and the operand order (the target of CCX is the last operand).
+    assert ke.compile_text('CCX q0 q1 q2\nCCX q2 q3 q4\n', 5).reaction_depth == 2
+    assert ke.compile_text('Z_POW q1 0.75\nCCX q2 q3 q1\n', 4).reaction_depth == 2
+    assert ke.compile_text('Z_POW q1 1.0\nCX q0 q1\n', 2).reaction_depth == 0
+    # CZ moves q2's bit-flip depth into q3's phase depth; HMR reads it (+1) into b0; the conditioned X carries it
+    # to q4 and the CCZ adds one more layer. Values checked with kickmix 1.0.0 and the 0.3.0 fork.
+    assert ke.compile_text('CCX q0 q1 q2\nHMR q2 b0\nX q3 if b0\nCCZ q3 q4 q5\n', 6).reaction_depth == 2
+    assert ke.compile_text('CCX q0 q1 q2\nCZ q2 q3\nHMR q3 b0\nX q4 if b0\nCCZ q4 q5 q6\n', 7).reaction_depth == 3
 
 
 # ---- DQI sampler -------------------------------------------------------------------------------------------------

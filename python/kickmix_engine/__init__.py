@@ -20,9 +20,8 @@ def seed_words(seed: int) -> np.ndarray:
     return np.array([(seed >> (32 * i)) & 0xFFFFFFFF for i in range(8)], dtype=np.uint32)
 
 
-def compile_circuit(circuit) -> Program:
-    """Compile a kickmix Circuit (loaded through the kickmix Python API) into an engine Program."""
-    text = str(circuit)
+def compile_text(text: str, num_qubits: int) -> Program:
+    """Compile kickmix circuit text (the `.kmx` form, as `str(circuit)` prints it). Z_POW angles are parsed exactly."""
     angles = []
     for line in text.splitlines():
         t = line.split()
@@ -31,7 +30,12 @@ def compile_circuit(circuit) -> Program:
             if h.denominator != 1:
                 raise ValueError("angle not representable in 128-bit fixed point: " + line)
             angles.append(int(h) % (1 << 128))
-    return Program.from_text(text, angles, circuit.num_qubits)
+    return Program.from_text(text, angles, num_qubits)
+
+
+def compile_circuit(circuit) -> Program:
+    """Compile a kickmix Circuit (loaded through the kickmix Python API) into an engine Program."""
+    return compile_text(str(circuit), circuit.num_qubits)
 
 
 def run(prog: Program, seeds, xs, xreg, *, s: int = 1, threads: int = 1, counting: bool = True, dump: bool = False):

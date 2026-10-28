@@ -18,7 +18,6 @@ import argparse, json, os, sys, time
 import numpy as np
 import kickmix as km
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'python'))
 import kickmix_engine as ke
 from kickmix_engine import dqi
 
@@ -28,11 +27,13 @@ ap.add_argument('--kmb', action='append', required=True)
 ap.add_argument('--failing', default=os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data',
                                                   'dqi_logged_failing_shots.jsonl'),
                 help='JSONL of logged failing shots (default: the records for the two M3 circuits, from Kaggle salt checks)')
-ap.add_argument('--scratch', required=True, help='directory for the mutated-circuit copy')
+ap.add_argument('--scratch', required=True, help='directory for the mutated-circuit copy (created if needed; '
+                'the copy is as large as the circuit, delete it afterwards)')
 ap.add_argument('--empty-chunks', default='0,1,2,200,399')
 a = ap.parse_args()
 if os.path.exists(a.out):
     sys.exit(f'refusing to overwrite {a.out}')
+os.makedirs(a.scratch, exist_ok=True)
 
 failing = [json.loads(l) for l in open(a.failing)]
 

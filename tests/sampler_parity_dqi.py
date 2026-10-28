@@ -15,7 +15,6 @@ a perturbed generator state and a shifted weight CDF must mismatch.
 import argparse, json, os, sys, time
 import numpy as np
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'python'))
 from kickmix_engine import _engine, words_to_bools
 from kickmix_engine import dqi
 from kickmix_engine.cache import file_sha256
