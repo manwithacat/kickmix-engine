@@ -55,6 +55,8 @@ def _kickmix():
 def _verifier(task):
     if task == 'dqi':
         from .dqi import default_verifier, load_verifier
+    elif task == 'dfthcsos':
+        from .dfthcsos import default_verifier, load_verifier
     else:
         from .invsqrt import default_verifier, load_verifier
     path = default_verifier()
@@ -64,7 +66,7 @@ def _verifier(task):
         out['error'] = ('not found: set KICKMIX_ENGINE_VERIFIERS to the competition verifiers/ directory'
                         if not path else 'file does not exist')
         return out
-    out['sha256'] = _sha256(path)
+    out['sha256'] = _sha256(os.path.join(path, 'verify.py') if os.path.isdir(path) else path)
     try:
         load_verifier(path)
         out['importable'] = True
@@ -176,7 +178,7 @@ def collect(manifest=None):
                    programs=len([f for f in os.listdir(progs) if f.endswith('.kmxprog')]) if os.path.isdir(progs) else 0),
         kickmix=_kickmix(),
         verifiers=dict(env=os.environ.get('KICKMIX_ENGINE_VERIFIERS'), dqi=_verifier('dqi'),
-                       invsqrt=_verifier('invsqrt')),
+                       invsqrt=_verifier('invsqrt'), dfthcsos=_verifier('dfthcsos')),
     )
     if manifest:
         try:
@@ -201,7 +203,7 @@ def _human(r):
         ('kickmix   ' + (f"{r['kickmix'].get('version')} {r['kickmix'].get('file')}" if r['kickmix']['importable']
                          else 'not importable: ' + r['kickmix']['error'])),
     ]
-    for t in ('dqi', 'invsqrt'):
+    for t in ('dqi', 'invsqrt', 'dfthcsos'):
         v = r['verifiers'][t]
         lines.append(f"verifier  {t}: " + ('importable ' + v['path'] if v.get('importable') else
                                            'NOT importable: ' + str(v.get('error'))))

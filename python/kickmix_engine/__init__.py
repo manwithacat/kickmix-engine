@@ -1,5 +1,5 @@
 """kickmix-engine: bit-sliced CPU simulator, per-shot compatible with kickmix, with task adapters that reproduce the
-official invsqrt and DQI verifiers. Written by an AI model (Claude) under the owner's direction; see NOTICE."""
+official invsqrt, DQI and dfthcsos (chemistry) verifiers. Written by an AI model (Claude) under the owner's direction; see NOTICE."""
 from __future__ import annotations
 
 from fractions import Fraction
@@ -8,6 +8,7 @@ import numpy as np
 
 from . import _engine
 from ._engine import Program, derive_keys, engine_version, kind_names, run as _run, run_batches as _run_batches
+from ._engine import run_sequence as _run_sequence
 
 __version__ = engine_version()[0]
 
@@ -110,6 +111,42 @@ def run_batches(prog: Program, seeds, qin_ids, qin, bin_ids, bin_, *, threads: i
     if dump:
         out["dump_q"] = r["dump_q"].reshape(n, prog.num_qubits, 4)
         out["dump_bits"] = r["dump_bits"].reshape(n, max(prog.num_bits, 1), 4)
+    return out
+
+
+def run_sequence(progs, seed, x0, xreg, *, threads: int = 1, counting: bool = True, dump: bool = False):
+    """Apply programs in turn to one kickmix ``Simulator(batch_size=shots, seed=seed)``, as the dfthcsos verifier does.
+
+    Step 0 starts from zero with the ``xreg`` qubits set from ``x0``; before each later step the simulator is
+    cleared (``clear_for_shot``: the measurement RNG stream and the operation counters continue) and the ``xreg``
+    qubits are written back from that shot's own output of the previous step. ``seed``: python int (the 256-bit
+    simulator seed) or 8 uint32 words. ``x0``: uint64 [shots, xw], xw = ceil(len(xreg) / 64), bit i of word i // 64 =
+    qubit ``xreg[i]``; shots need not be a multiple of 256. Returns x_out uint64 [steps, shots, xw], dirty and phase
+    bool [steps, shots] (a non-xreg qubit below that step's ``num_qubits`` is nonzero; phase flipped),
+    kind_counts [steps, len(KINDS)], z_levels [steps, 129] and toffoli_count [steps] (CCX+CCZ+CSWAP over all shots).
+    With dump=True also dump_q uint64 [steps, sims, nq, 4] (every qubit up to the widest program) and dump_bits
+    [steps, sims, nb, 4] (classical bits in the compact ids of that step's program, see ``Program.bit_compact``),
+    bit-sliced with 256 shots per sim. The GIL is released during simulation.
+    """
+    seed = seed_words(seed) if isinstance(seed, int) else np.asarray(seed, dtype=np.uint32)
+    x0 = np.ascontiguousarray(x0, dtype=np.uint64)
+    if x0.ndim == 1:
+        x0 = x0[:, None]
+    shots, xw = x0.shape
+    if xw != max(1, -(-len(xreg) // 64)):
+        raise ValueError(f"x0 must have ceil(len(xreg) / 64) = {max(1, -(-len(xreg) // 64))} words per shot")
+    progs = list(progs)
+    r = _run_sequence(progs, [int(x) for x in seed], x0.reshape(-1), [int(q) for q in xreg], shots, threads, counting, dump)
+    ns = len(progs)
+    out = dict(x_out=r["x_out"].reshape(ns, shots, xw), dirty=r["dirty"].reshape(ns, shots).view(bool),
+               phase=r["phase"].reshape(ns, shots).view(bool))
+    out["kind_counts"] = kc = r["kind_counts"].reshape(ns, len(KINDS))
+    out["z_levels"] = r["z_levels"].reshape(ns, 129)
+    out["toffoli_count"] = sum(kc[:, KINDS.index(k)] for k in TOFFOLI_KINDS)
+    if dump:
+        nsims = -(-shots // 256)
+        out["dump_q"] = r["dump_q"].reshape(ns, nsims, r["dump_nq"], 4)
+        out["dump_bits"] = r["dump_bits"].reshape(ns, nsims, r["dump_nb"], 4)
     return out
 
 

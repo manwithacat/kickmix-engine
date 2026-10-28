@@ -264,6 +264,49 @@ fn run_dqi<'py>(
     Ok(d)
 }
 
+/// A sequence of programs on one kickmix `Simulator(batch_size=shots, seed)` (the dfthcsos verifier's loop):
+/// step i runs progs[i]; between steps `clear_for_shot()` and the xreg qubits are written back from the previous
+/// step's own output. x0: uint64 [shots * xw], xw = ceil(len(xreg)/64). Returns x_out [steps * shots * xw],
+/// dirty and phase (uint8 [steps * shots]), kind_counts [steps * NCOUNT], z_levels [steps * 129]; with dump=True
+/// also dump_q [steps * sims * dump_nq * 4] and dump_bits [steps * sims * dump_nb * 4] (bit-sliced, 256 shots/sim).
+#[pyfunction]
+#[pyo3(signature = (progs, seed, x0, xreg, shots, threads=1, counting=true, dump=false))]
+#[allow(clippy::too_many_arguments)]
+fn run_sequence<'py>(
+    py: Python<'py>,
+    progs: Vec<PyRef<'py, PyProgram>>,
+    seed: [u32; 8],
+    x0: PyReadonlyArray1<u64>,
+    xreg: Vec<u32>,
+    shots: usize,
+    threads: usize,
+    counting: bool,
+    dump: bool,
+) -> PyResult<Bound<'py, PyDict>> {
+    let arcs: Vec<Arc<program::Program>> = progs.iter().map(|p| p.inner.clone()).collect();
+    let x0s = x0.as_slice()?;
+    let out = py
+        .detach(|| {
+            let refs: Vec<&program::Program> = arcs.iter().map(|a| a.as_ref()).collect();
+            let spec = engine::SeqSpec { progs: &refs, seed: &seed, shots, xreg: &xreg, x0: x0s, counting, dump, threads };
+            engine::run_sequence(&spec)
+        })
+        .map_err(PyValueError::new_err)?;
+    let d = PyDict::new(py);
+    d.set_item("x_out", PyArray1::from_vec(py, out.x_out))?;
+    d.set_item("dirty", PyArray1::from_vec(py, out.dirty))?;
+    if dump {
+        d.set_item("dump_nq", out.dump_nq)?;
+        d.set_item("dump_nb", out.dump_nb)?;
+        d.set_item("dump_q", PyArray1::from_vec(py, out.dump_q))?;
+        d.set_item("dump_bits", PyArray1::from_vec(py, out.dump_bits))?;
+    }
+    d.set_item("phase", PyArray1::from_vec(py, out.phase))?;
+    d.set_item("kind_counts", PyArray1::from_vec(py, out.kind_counts))?;
+    d.set_item("z_levels", PyArray1::from_vec(py, out.z_levels))?;
+    Ok(d)
+}
+
 /// Engine identity for cache keys: (crate version, program-cache format).
 #[pyfunction]
 fn engine_version() -> (&'static str, u32) {
@@ -315,6 +358,7 @@ fn _engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(run_batches, m)?)?;
     m.add_function(wrap_pyfunction!(sample_dqi, m)?)?;
     m.add_function(wrap_pyfunction!(run_dqi, m)?)?;
+    m.add_function(wrap_pyfunction!(run_sequence, m)?)?;
     m.add_function(wrap_pyfunction!(engine_version, m)?)?;
     m.add_function(wrap_pyfunction!(cpu_info, m)?)?;
     m.add_function(wrap_pyfunction!(kernel_info, m)?)?;

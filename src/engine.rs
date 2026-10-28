@@ -500,3 +500,206 @@ pub fn sample_dqi(sampler: &DqiSampler, pcg: &[Pcg64], threads: usize, keep_valu
     }
     Ok(out)
 }
+
+// ---------------------------------------------------------------------------------------------------------------
+// 0.5.0: a sequence of programs on one kickmix `Simulator(batch_size=shots, seed)`, as the dfthcsos (chemistry)
+// verifier drives it: `do(circuit_0)`, checks, `clear_for_shot()`, the public registers written back, `do(circuit_1)`,
+// ... Each 256-shot sim (and so its ChaCha8 stream and its operation counters) lives across all the steps.
+
+pub struct SeqSpec<'a> {
+    /// One program per step, in the order they are applied.
+    pub progs: &'a [&'a Program],
+    /// The simulator seed (8 LE u32 words of the 256-bit seed): kickmix `Simulator(batch_size=shots, seed=...)`.
+    pub seed: &'a [u32; 8],
+    /// kickmix batch_size; need not be a multiple of 256 (the last sim's extra lanes start at zero, are reset to
+    /// zero between steps, and are not counted, as in kickmix).
+    pub shots: usize,
+    /// Qubits written before step 0 and carried across `clear_for_shot` between steps (the public registers).
+    pub xreg: &'a [u32],
+    /// Inputs [shot][xw] u64, xw = ceil(len(xreg) / 64): bit i of word i / 64 is qubit xreg[i].
+    pub x0: &'a [u64],
+    pub counting: bool,
+    /// Also return the whole state after every step (for parity tests).
+    pub dump: bool,
+    pub threads: usize,
+}
+
+pub struct SeqOut {
+    /// [step][shot][xw] the xreg qubits after each step.
+    pub x_out: Vec<u64>,
+    /// [step][shot] 1 if any qubit below the step's program `num_qubits` that is not in xreg is nonzero.
+    pub dirty: Vec<u8>,
+    /// [step][shot] phase flipped (kickmix `read_phase_flipped_across_shots`).
+    pub phase: Vec<u8>,
+    /// [step][NCOUNT] operation counts of each step, summed over the `shots` shots.
+    pub kind_counts: Vec<u64>,
+    /// [step][129]
+    pub z_levels: Vec<u64>,
+    /// dump: [step][sim][qubit][4] (qubits up to the largest program), [step][sim][compact bit][4] (the step's
+    /// program's compact ids), and the qubit and bit counts used.
+    pub dump_q: Vec<u64>,
+    pub dump_bits: Vec<u64>,
+    pub dump_nq: usize,
+    pub dump_nb: usize,
+}
+
+/// Per-step kind counts and Z_POW level counts of one 256-shot sim.
+type StepCounts = (Vec<[u64; NCOUNT]>, Vec<[u64; 129]>);
+
+pub fn run_sequence(spec: &SeqSpec) -> Result<SeqOut, String> {
+    crate::kernel::selected()?;
+    let ns = spec.progs.len();
+    if ns == 0 {
+        return Err("at least one program is required".into());
+    }
+    let shots = spec.shots;
+    if shots == 0 {
+        return Err("shots must be positive".into());
+    }
+    let width = spec.xreg.len();
+    let xw = width.div_ceil(64).max(1);
+    if spec.x0.len() != shots * xw {
+        return Err(format!("x0 has {} entries, expected shots * ceil(len(xreg) / 64) = {}", spec.x0.len(), shots * xw));
+    }
+    let mut nq = spec.progs.iter().map(|p| p.num_qubits).max().unwrap();
+    let nb = spec.progs.iter().map(|p| p.num_bits).max().unwrap();
+    let depth = spec.progs.iter().map(|p| p.max_stack_depth).max().unwrap();
+    for &q in spec.xreg {
+        nq = nq.max(q as usize + 1);
+    }
+    let mut seen = vec![false; nq];
+    for &q in spec.xreg {
+        if seen[q as usize] {
+            return Err("xreg repeats a qubit".into());
+        }
+        seen[q as usize] = true;
+    }
+    let scratch: Vec<Vec<usize>> = spec.progs.iter().map(|p| (0..p.num_qubits).filter(|&i| !seen[i]).collect()).collect();
+    let has_angles: Vec<bool> = spec.progs.iter().map(|p| !p.angles.is_empty()).collect();
+    let nsims = shots.div_ceil(256);
+
+    let mut x_out = vec![0u64; ns * shots * xw];
+    let mut dirty = vec![0u8; ns * shots];
+    let mut phase = vec![0u8; ns * shots];
+    let (px, pd, pp) = (SP(x_out.as_mut_ptr()), SP(dirty.as_mut_ptr()), SP(phase.as_mut_ptr()));
+    let nbd = nb.max(1);
+    let (mut dump_q, mut dump_bits) = (Vec::new(), Vec::new());
+    if spec.dump {
+        dump_q = vec![0u64; ns * nsims * nq * 4];
+        dump_bits = vec![0u64; ns * nsims * nbd * 4];
+    }
+    let (pdq, pdb) = (SP(dump_q.as_mut_ptr()), SP(dump_bits.as_mut_ptr()));
+    let mut master = Mt64::from_seed_seq(spec.seed);
+    let sim_seeds: Vec<[u32; 8]> = (0..nsims).map(|_| sim_seed_words(&mut master)).collect();
+
+    let res: Vec<Result<StepCounts, String>> = pool(spec.threads).install(|| {
+        (0..nsims)
+            .into_par_iter()
+            .with_max_len(1)
+            .map(|u| {
+                let base = u * 256;
+                let nl = (shots - base).min(256);
+                let mut lanes = W::ZERO;
+                for s in 0..nl {
+                    lanes.0[s / 64] |= 1u64 << (s % 64);
+                }
+                let partial = nl < 256;
+                let mut sim = Sim::with_dims(nq, nb, depth, keys_from_sim_seed(&sim_seeds[u]));
+                // Inputs: transpose 64 shots x 64 register bits at a time.
+                let mut rows = [0u64; 64];
+                for w in 0..4 {
+                    for xb in 0..xw {
+                        for r in 0..64 {
+                            let s = base + 64 * w + r;
+                            rows[r] = if s < shots { spec.x0[s * xw + xb] } else { 0 };
+                        }
+                        transpose64(&mut rows);
+                        for i in 0..(width - 64 * xb).min(64) {
+                            sim.q[spec.xreg[64 * xb + i] as usize].0[w] = rows[i];
+                        }
+                    }
+                }
+                let mut kc = Vec::with_capacity(ns);
+                let mut zl = Vec::with_capacity(ns);
+                let mut keep = vec![W::ZERO; width];
+                for (st, prog) in spec.progs.iter().enumerate() {
+                    if st > 0 {
+                        // The verifier's reset: clear_for_shot (the RNG stream continues), then the public registers
+                        // are written back for the real shots only.
+                        for (i, &q) in spec.xreg.iter().enumerate() {
+                            keep[i] = sim.q[q as usize] & lanes;
+                        }
+                        sim.clear_for_shot();
+                        for (i, &q) in spec.xreg.iter().enumerate() {
+                            sim.q[q as usize] = keep[i];
+                        }
+                    }
+                    match (spec.counting, partial) {
+                        (true, false) => sim.run::<true>(prog),
+                        (true, true) => sim.run_lanes::<true>(prog, lanes),
+                        (false, _) => sim.run::<false>(prog),
+                    }
+                    let ph = sim.phase_flipped_first(has_angles[st], nl).map_err(|e| format!("step {}: {}", st, e))?;
+                    let mut dw = W::ZERO;
+                    for &i in &scratch[st] {
+                        dw = dw | sim.q[i];
+                    }
+                    // SAFETY: sim u writes only shots base..base+nl of each step.
+                    unsafe {
+                        for w in 0..4 {
+                            for xb in 0..xw {
+                                rows = [0u64; 64];
+                                for i in 0..(width - 64 * xb).min(64) {
+                                    rows[i] = sim.q[spec.xreg[64 * xb + i] as usize].0[w];
+                                }
+                                transpose64(&mut rows);
+                                for r in 0..64 {
+                                    let s = base + 64 * w + r;
+                                    if s < shots {
+                                        *px.p().add((st * shots + s) * xw + xb) = rows[r];
+                                    }
+                                }
+                            }
+                        }
+                        for l in 0..nl {
+                            let s = base + l;
+                            *pd.p().add(st * shots + s) = ((dw.0[l / 64] >> (l % 64)) & 1) as u8;
+                            *pp.p().add(st * shots + s) = ((ph.0[l / 64] >> (l % 64)) & 1) as u8;
+                        }
+                        if spec.dump {
+                            let ub = st * nsims + u;
+                            for i in 0..nq {
+                                for w in 0..4 {
+                                    *pdq.p().add((ub * nq + i) * 4 + w) = sim.q[i].0[w];
+                                }
+                            }
+                            for i in 0..nbd.min(sim.bits.len()) {
+                                for w in 0..4 {
+                                    *pdb.p().add((ub * nbd + i) * 4 + w) = sim.bits[i].0[w];
+                                }
+                            }
+                        }
+                    }
+                    kc.push(sim.counts.kinds());
+                    zl.push(sim.counts.zlevels());
+                    sim.counts = Counts::new();
+                }
+                Ok((kc, zl))
+            })
+            .collect()
+    });
+    let mut kind_counts = vec![0u64; ns * NCOUNT];
+    let mut z_levels = vec![0u64; ns * 129];
+    for r in res {
+        let (kc, zl) = r?;
+        for st in 0..ns {
+            for k in 0..NCOUNT {
+                kind_counts[st * NCOUNT + k] += kc[st][k];
+            }
+            for k in 0..129 {
+                z_levels[st * 129 + k] += zl[st][k];
+            }
+        }
+    }
+    Ok(SeqOut { x_out, dirty, phase, kind_counts, z_levels, dump_q, dump_bits, dump_nq: nq, dump_nb: nbd })
+}

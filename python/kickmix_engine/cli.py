@@ -2,12 +2,13 @@
 
     kickmix-engine verify dqi CIRCUIT.kmb [--salt S] [--threads N] [--cross-check] ...
     kickmix-engine verify invsqrt CIRCUIT.kmb [--salt S] [--threads N] [--cross-check] ...
+    kickmix-engine verify dfthcsos SUBMISSION_DIR [--salt S] [--threads N] [--cross-check] ...
     kickmix-engine cache info|prune|clear [--cache-dir DIR]
     kickmix-engine doctor [--json] [--manifest PATH_OR_URL]
 
 `verify` prints the official verifier's summary JSON (same fields, including `reaction_depth`) and exits 0 on PASS,
 1 on FAIL ({"status": "FAIL", "error": ...}), like the official CLI. The official
-verifier file is required (it supplies seeds, sampling, the reference table and the statistics): pass --verifier or
+verifier file (for dfthcsos: the official `dfthcsos` package directory) is required (it supplies seeds, sampling, the reference table and the statistics): pass --verifier or
 set KICKMIX_ENGINE_VERIFIERS to the competition's `verifiers/` directory. The verifier imports kickmix, so kickmix must
 be importable in this interpreter (the simulation itself does not use it).
 
@@ -37,12 +38,22 @@ def _verifier_path(task, given):
         return os.path.abspath(given)
     if task == 'dqi':
         from .dqi import default_verifier
+    elif task == 'dfthcsos':
+        from .dfthcsos import default_verifier
     else:
         from .invsqrt import default_verifier
     return default_verifier()
 
 
 def _engine_verify(a, cache):
+    if a.task == 'dfthcsos':
+        from . import dfthcsos
+        info = {}
+        out = dfthcsos.verify(a.circuit_file, a.factorization, a.tree_edges, format=a.format,
+                              shots_per_address=a.shots_per_address, seed=a.seed, salt=a.salt, threads=a.threads,
+                              verifier=a.verifier, cache=cache, fcidump_cache=not (a.no_cache or a.no_fcidump_cache),
+                              low_memory=not a.no_low_memory, info=info)
+        return out, info
     if a.task == 'dqi':
         from . import dqi
         kw = dict(m=a.m, n=a.n, degree=a.degree, r=a.r, num_shots=a.num_shots)
@@ -70,6 +81,19 @@ def _engine_verify(a, cache):
 
 
 def _official_cmd(a):
+    if a.task == 'dfthcsos':
+        from .dfthcsos import _package_dir
+        cmd = [a.official_python or sys.executable, str(_package_dir(a.verifier) / 'verify.py')]
+        cmd += ([a.factorization] if a.factorization else []) + [a.circuit_file, '--salt', a.salt]
+        if a.seed is not None:
+            cmd += ['--seed', str(a.seed)]
+        if a.tree_edges:
+            cmd += ['--tree-edges', a.tree_edges]
+        if a.format != 'auto':
+            cmd += ['--format', a.format]
+        if a.shots_per_address is not None:
+            cmd += ['--shots-per-address', str(a.shots_per_address)]
+        return cmd
     cmd = [a.official_python or sys.executable, a.verifier, a.circuit_file, '--salt', a.salt]
     if a.seed is not None:
         cmd += ['--seed', str(a.seed)]
@@ -109,10 +133,12 @@ def cmd_verify(a):
               'cpu_features': sorted(f for f, d in kinfo['features'].items() if d)}
     cache = ProgramCache(a.cache_dir, enabled=not a.no_cache)
     t0 = time.perf_counter()
+    # The exceptions each official CLI reports as FAIL (the dfthcsos CLI also catches KeyError).
+    caught = (AssertionError, ValueError, RuntimeError, OSError) + ((KeyError,) if a.task == 'dfthcsos' else ())
     try:
         eng, info = _engine_verify(a, cache)
         rc = 0
-    except (AssertionError, ValueError, RuntimeError, OSError) as ex:
+    except caught as ex:
         eng, info, rc = {'status': 'FAIL', 'error': str(ex)}, {}, 1
     info['total_s'] = time.perf_counter() - t0
     info['kernel'] = kernel
@@ -160,9 +186,10 @@ def main(argv=None):
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest='cmd', required=True)
     v = sub.add_parser('verify', help='verify a circuit like the official verifier, with the engine as simulator')
-    v.add_argument('task', choices=('dqi', 'invsqrt'))
-    v.add_argument('circuit_file', help='.kmb circuit file')
-    v.add_argument('--verifier', default=None, help='official verify_submission_*.py (default: $KICKMIX_ENGINE_VERIFIERS)')
+    v.add_argument('task', choices=('dqi', 'invsqrt', 'dfthcsos'))
+    v.add_argument('circuit_file', help='.kmb circuit file (dfthcsos: the submission directory, or one circuit file)')
+    v.add_argument('--verifier', default=None, help='official verify_submission_*.py, or for dfthcsos the dfthcsos '
+                   'package directory (default: from $KICKMIX_ENGINE_VERIFIERS)')
     v.add_argument('--salt', default='')
     v.add_argument('--seed', type=int, default=None)
     v.add_argument('--threads', type=int, default=os.cpu_count() or 1)
@@ -178,6 +205,14 @@ def main(argv=None):
     g.add_argument('--self-check', type=int, default=0, help='re-draw K batches (-1: all) with the official sample_shots')
     g.add_argument('--m', type=int); g.add_argument('--n', type=int); g.add_argument('--degree', type=int)
     g.add_argument('--r', type=int); g.add_argument('--num-shots', type=int); g.add_argument('--log2-delta', type=float)
+    g = v.add_argument_group('dfthcsos')
+    g.add_argument('--factorization', default=None, help='factorization .npz (default: submission.npz in the directory)')
+    g.add_argument('--tree-edges', default=None, help='.npy/.npz with the Givens tree (default: submission.npz)')
+    g.add_argument('--format', choices=('auto', 'kmb', 'kmx'), default='auto')
+    g.add_argument('--shots-per-address', type=int, default=None)
+    g.add_argument('--no-fcidump-cache', action='store_true', help='always parse the FCIDUMP (the official way)')
+    g.add_argument('--no-low-memory', action='store_true',
+                   help='leave the error_2 tensor in the official layout (one more N^4 copy at the peak)')
     g = v.add_argument_group('invsqrt')
     g.add_argument('--n-p', type=int); g.add_argument('--beta', type=Fraction, default=Fraction(1))
     g.add_argument('--precision-bits', type=int, default=24); g.add_argument('--shots-per-x', type=int)

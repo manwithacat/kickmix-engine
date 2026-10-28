@@ -97,12 +97,18 @@ pub struct Sim {
 
 impl Sim {
     pub fn new(prog: &Program, keys: Keys) -> Sim {
+        Sim::with_dims(prog.num_qubits, prog.num_bits, prog.max_stack_depth, keys)
+    }
+
+    /// A sim with room for `num_qubits` qubits and `num_bits` compact bits, so several programs can run on it in
+    /// turn (each program's ids are below its own counts; see `engine::run_sequence`).
+    pub fn with_dims(num_qubits: usize, num_bits: usize, max_stack_depth: usize, keys: Keys) -> Sim {
         Sim {
-            q: vec![W::ZERO; prog.num_qubits.max(1)],
-            bits: vec![W::ZERO; prog.num_bits.max(1)],
+            q: vec![W::ZERO; num_qubits.max(1)],
+            bits: vec![W::ZERO; num_bits.max(1)],
             phase: W::ZERO,
             angles: vec![0u128; 256],
-            stack: Vec::with_capacity(prog.max_stack_depth.max(8)),
+            stack: Vec::with_capacity(max_stack_depth.max(8)),
             rng: ChaCha8::new(keys),
             counts: Counts::new(),
         }
@@ -120,11 +126,16 @@ impl Sim {
     /// Final phase per shot as kickmix `read_phase_flipped_across_shots` reads it: `Err` if any shot's phase is
     /// not a multiple of a half turn.
     pub fn phase_flipped(&self, has_angles: bool) -> Result<W, String> {
+        self.phase_flipped_first(has_angles, 256)
+    }
+
+    /// `phase_flipped` over the first `n` shots only (the rest of the result is unspecified).
+    pub fn phase_flipped_first(&self, has_angles: bool, n: usize) -> Result<W, String> {
         if !has_angles {
             return Ok(self.phase);
         }
         let mut out = W::ZERO;
-        for s in 0..256 {
+        for s in 0..n.min(256) {
             let ph = (self.phase.0[s / 64] >> (s % 64)) & 1;
             let v = self.angles[s] ^ ((ph as u128) << 127);
             if v << 1 != 0 {
@@ -138,37 +149,50 @@ impl Sim {
     /// Run the program on this sim with the process's kernel (see `kernel`): the same body compiled for baseline
     /// x86-64, AVX2 (x86-64-v3) or AVX-512 (x86-64-v4); on aarch64 the single (NEON) build.
     pub fn run<const COUNT: bool>(&mut self, prog: &Program) {
+        self.dispatch::<COUNT, false>(prog, W::ONES)
+    }
+
+    /// Like `run`, but operation counts include only the shots set in `lanes` (kickmix counts only the first
+    /// `batch_size` shots of its last, partly used 256-shot sim). The state of every lane is simulated as usual.
+    pub fn run_lanes<const COUNT: bool>(&mut self, prog: &Program, lanes: W) {
+        self.dispatch::<COUNT, true>(prog, lanes)
+    }
+
+    #[inline(always)]
+    fn dispatch<const COUNT: bool, const MASK: bool>(&mut self, prog: &Program, lanes: W) {
         #[cfg(target_arch = "x86_64")]
         {
             use crate::kernel::Kernel;
             // SAFETY: `kernel::active()` returns Avx2/Avx512 only if `is_x86_feature_detected!` found every
             // feature these copies are compiled with.
             match crate::kernel::active() {
-                Kernel::Avx512 => unsafe { self.run_avx512::<COUNT>(prog) },
-                Kernel::Avx2 => unsafe { self.run_avx2::<COUNT>(prog) },
-                _ => self.run_impl::<COUNT>(prog),
+                Kernel::Avx512 => unsafe { self.run_avx512::<COUNT, MASK>(prog, lanes) },
+                Kernel::Avx2 => unsafe { self.run_avx2::<COUNT, MASK>(prog, lanes) },
+                _ => self.run_impl::<COUNT, MASK>(prog, lanes),
             }
         }
         #[cfg(not(target_arch = "x86_64"))]
-        self.run_impl::<COUNT>(prog)
+        self.run_impl::<COUNT, MASK>(prog, lanes)
     }
 
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "avx2,bmi1,bmi2,fma,lzcnt,movbe")]
-    unsafe fn run_avx2<const COUNT: bool>(&mut self, prog: &Program) {
-        self.run_impl::<COUNT>(prog)
+    unsafe fn run_avx2<const COUNT: bool, const MASK: bool>(&mut self, prog: &Program, lanes: W) {
+        self.run_impl::<COUNT, MASK>(prog, lanes)
     }
 
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "avx2,bmi1,bmi2,fma,lzcnt,movbe,avx512f,avx512bw,avx512vl,avx512dq")]
-    unsafe fn run_avx512<const COUNT: bool>(&mut self, prog: &Program) {
-        self.run_impl::<COUNT>(prog)
+    unsafe fn run_avx512<const COUNT: bool, const MASK: bool>(&mut self, prog: &Program, lanes: W) {
+        self.run_impl::<COUNT, MASK>(prog, lanes)
     }
 
     /// The simulator loop. `inline(always)` so each kernel wrapper above gets its own copy compiled with its
     /// target features (W's operations are `inline(always)` too and vectorise to the widest registers enabled).
+    /// With `MASK = false` (every caller except `run_lanes`) `lanes` is unused and the loop is the 0.4.0 loop; with
+    /// `MASK = true` every count goes to the per-shot sums (`part`) restricted to `lanes`.
     #[inline(always)]
-    fn run_impl<const COUNT: bool>(&mut self, prog: &Program) {
+    fn run_impl<const COUNT: bool, const MASK: bool>(&mut self, prog: &Program, lanes: W) {
         let code = prog.code.as_ptr();
         let n = prog.code.len();
         let qp = self.q.as_mut_ptr();
@@ -181,9 +205,14 @@ impl Sim {
         let mut base = W::ONES;
         let mut full = true;
         let mut i = 0usize;
+        let nl = if MASK { lanes.popcnt() } else { 256 };
         if COUNT {
             // INFO_TAG: counted with an all-ones mask on every execution, no other effect.
-            counts.full[K_INFO as usize] += prog.n_info_tags;
+            if MASK {
+                counts.part[K_INFO as usize] += prog.n_info_tags * nl;
+            } else {
+                counts.full[K_INFO as usize] += prog.n_info_tags;
+            }
         }
         // SAFETY: the Builder guarantees qubit ids < num_qubits (Sim::new sizes q from it), compact bit ids <
         // num_bits, angle indices < angles.len(), every opcode has its OP_LEN words and run headers are followed
@@ -203,7 +232,11 @@ impl Sim {
                             *qp.add((r >> 16) as usize) ^= t;
                         }
                         if COUNT {
-                            counts.full[K_CX as usize] += cnt as u64;
+                            if MASK {
+                                counts.part[K_CX as usize] += cnt as u64 * nl;
+                            } else {
+                                counts.full[K_CX as usize] += cnt as u64;
+                            }
                         }
                     } else {
                         for j in 0..cnt {
@@ -212,7 +245,8 @@ impl Sim {
                             *qp.add((r >> 16) as usize) ^= t;
                         }
                         if COUNT {
-                            counts.part[K_CX as usize] += cnt as u64 * base.popcnt();
+                            let m = if MASK { base & lanes } else { base };
+                            counts.part[K_CX as usize] += cnt as u64 * m.popcnt();
                         }
                     }
                     continue;
@@ -290,7 +324,9 @@ impl Sim {
                         let ang = *prog.angles.get_unchecked(idx);
                         if COUNT {
                             let lv = *prog.levels.get_unchecked(idx) as usize;
-                            if cfull {
+                            if MASK {
+                                counts.zpart[lv] += if cfull { nl } else { (cond & lanes).popcnt() };
+                            } else if cfull {
                                 counts.zfull[lv] += 1;
                             } else {
                                 counts.zpart[lv] += cond.popcnt();
@@ -334,7 +370,9 @@ impl Sim {
                 i += len;
                 if COUNT {
                     let k = kind as usize;
-                    if cfull {
+                    if MASK {
+                        counts.part[k] += if cfull { nl } else { (cond & lanes).popcnt() };
+                    } else if cfull {
                         counts.full[k] += 1;
                     } else {
                         counts.part[k] += cond.popcnt();

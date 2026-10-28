@@ -3,6 +3,42 @@
 All notable changes to kickmix-engine. Dates are UTC. The project was written by an AI model (Claude) under the
 owner's direction; see NOTICE.
 
+## 0.5.0 (2026-10-28)
+
+### Added
+- **Chemistry (`dfthcsos`) task.** `kickmix-engine verify dfthcsos SUBMISSION_DIR [--cross-check]` and
+  `kickmix_engine.dfthcsos.verify(...)` reproduce the official `dfthcsos/verify.py` (FeMoCo76o113e): the official
+  package is imported from the verifiers directory and its own functions do the loading, hashing, register checks,
+  DF-THC metrics, cost model and score; the engine replaces kickmix's simulator, and the FCIDUMP is read through a
+  cache. Options mirror the official CLI (`--factorization`, `--tree-edges`, `--format`, `--shots-per-address`,
+  `--salt`, `--seed`), plus `--no-fcidump-cache` and `--no-low-memory`. `doctor` reports the dfthcsos verifier.
+- `run_sequence(progs, seed, x0, xreg, *, threads, counting, dump)` (Rust `engine::run_sequence`): several programs
+  applied in turn to one kickmix `Simulator(batch_size=shots, seed)`, as the dfthcsos verifier drives it. Each
+  256-shot sim lives across all steps, so its ChaCha8 stream and operation counters continue; between steps it is
+  cleared (`clear_for_shot`) and the carried register is written back. Registers wider than 64 qubits, and batch
+  sizes that are not a multiple of 256 (the extra lanes of the last sim are zeroed between steps and not counted, as
+  in kickmix), are supported. Per-step outputs: the carried register, a workspace flag, the phase flip and per-kind
+  operation counts.
+- `Sim::run_lanes` / `Sim::with_dims`: counting restricted to the real shots of a partly used sim, and sims sized for
+  several programs. The counting-off and full-sim paths are the 0.4.0 loop (a const generic selects the masked
+  variant), so invsqrt and DQI are unchanged.
+- FCIDUMP cache: the official parser's packed float32 integrals, keyed by the FCIDUMP's SHA-256 and the SHA-256 of
+  the official `reference.py`, under `<cache dir>/fcidump/`. The official `check_fcidump` (size and SHA-256 of the
+  128 MB file) still runs on every verification. An entry is written only after a round trip reproduced the parsed
+  `tei`, `h1_thc` and `oei` bit for bit, carries a SHA-256 of its arrays and is re-parsed if it does not verify.
+- Lower peak memory with identical results: during `evaluate_words` the official Gram tensor (`reconstruct_h2`, an
+  einsum that returns a transposed view of an N^2 x N^2 buffer) is transposed in place into C order, so the official
+  `np.linalg.norm(h2_delta.ravel())` no longer copies 255 MiB. Values are moved, not recomputed.
+- Tests: `tests/test_dfthcsos.py` (run_sequence against a chain of independent runs with the RNG carried by dummy
+  `R` ops, partly used sims, wide registers, input errors, the in-place transpose; with kickmix: per-shot and
+  per-count parity against kickmix's Simulator at 300 and 512 shots; with the official verifiers: FCIDUMP cache round
+  trip and corruption, task parity on the sample submission). Scripts `tests/parity_dfthcsos.py` (per-shot parity of
+  every step against the official loop, with negative controls) and `tests/task_parity_dfthcsos.py` (`--cross-check`
+  on real and mutated families, PASS and FAIL).
+
+### Changed
+- Version 0.5.0. The program cache format is unchanged (2); entries are keyed by the extension hash as before.
+
 ## 0.4.0 (2026-10-28)
 
 ### Added

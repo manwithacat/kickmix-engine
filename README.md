@@ -1,7 +1,8 @@
 # kickmix-engine
 
 kickmix-engine is a CPU simulator for [kickmix](https://github.com/quantumlib/Qualtran/tree/main/kickmix) circuits,
-written in Rust, plus a `kickmix-engine verify` command for the **invsqrt** and **DQI** tasks of the Kaggle competition
+written in Rust, plus a `kickmix-engine verify` command for the **invsqrt**, **DQI** and **chemistry (`dfthcsos`)**
+tasks of the Kaggle competition
 [Google Quantum AI: Verifiable Quantum Circuit Compilation](https://www.kaggle.com/competitions/google-verifiable-quantum-circuit-compilation)
 (VQCC). It is an independent re-implementation of kickmix's simulation semantics. It has been checked shot for shot
 against kickmix: every qubit, every classical bit, the exact phase and the operation counts. `verify` runs the
@@ -21,8 +22,8 @@ Requirements: Python 3.12 or later on macOS arm64 or Linux x86_64. NumPy is inst
 
 ```sh
 # Wheels are attached to each GitHub release (abi3: one wheel per platform serves every Python >= 3.12).
-pip install https://github.com/manwithacat/kickmix-engine/releases/download/v0.4.0/kickmix_engine-0.4.0-cp312-abi3-macosx_11_0_arm64.whl
-pip install https://github.com/manwithacat/kickmix-engine/releases/download/v0.4.0/kickmix_engine-0.4.0-cp312-abi3-manylinux_2_28_x86_64.whl
+pip install https://github.com/manwithacat/kickmix-engine/releases/download/v0.5.0/kickmix_engine-0.5.0-cp312-abi3-macosx_11_0_arm64.whl
+pip install https://github.com/manwithacat/kickmix-engine/releases/download/v0.5.0/kickmix_engine-0.5.0-cp312-abi3-manylinux_2_28_x86_64.whl
 
 # kickmix must also be importable: the official verifier modules import it, even though the engine never uses it to simulate.
 pip install kickmix   # kickmix 1.0.0 from PyPI, or the faster fork below
@@ -47,11 +48,12 @@ pip install maturin && maturin build --release --locked -o dist && pip install d
 
 ## What you need besides the package
 
-- **The official verifiers.** `verify_submission_dqi.py` and `verify_submission_invsqrt.py` ship in the `verifiers/`
+- **The official verifiers.** `verify_submission_dqi.py`, `verify_submission_invsqrt.py` and the `dfthcsos` package ship in the `verifiers/`
   directory of the competition data. Download them from the competition's Data tab, or with
   `kaggle competitions download -c google-verifiable-quantum-circuit-compilation` once you have accepted the rules.
   They are not redistributed here. Point the engine at that directory:
-  `export KICKMIX_ENGINE_VERIFIERS=/path/to/verifiers` (it must contain `dqi/` and `invsqrt/`).
+  `export KICKMIX_ENGINE_VERIFIERS=/path/to/verifiers` (it must contain `dqi/`, `invsqrt/` and `dfthcsos/`). The
+  chemistry verifier also needs SciPy, as the official one does.
 - **Circuits to verify.** Use your own `.kmb` files, the competition's `sample_submission/`, or the public Kaggle
   dataset [manwithacat/vqcc-apache-public-circuits](https://www.kaggle.com/datasets/manwithacat/vqcc-apache-public-circuits).
   That dataset collects circuits published in Apache-2.0 notebooks, including the two DQI circuits used below
@@ -65,6 +67,7 @@ export KICKMIX_ENGINE_VERIFIERS=/path/to/verifiers
 kickmix-engine verify dqi circuits/dqi/4ee7a17b4cbc.kmb                    # prints the official summary JSON
 kickmix-engine verify dqi circuits/dqi/4ee7a17b4cbc.kmb --salt my-salt --cross-check --official-workers 4
 kickmix-engine verify invsqrt sample_submission/invsqrt.kmb --cross-check
+kickmix-engine verify dfthcsos sample_submission/dfthcsos/ --cross-check    # a directory: angle_k_*.kmb + submission.npz
 ```
 
 From Python:
@@ -78,6 +81,7 @@ summary = DQITask("4ee7a17b4cbc.kmb").verify(salt="", threads=8)   # the officia
 
 ```
 kickmix-engine verify {dqi,invsqrt} CIRCUIT.kmb [--salt S] [--seed N] [--threads N] [--cross-check] [options]
+kickmix-engine verify dfthcsos SUBMISSION_DIR [--salt S] [--seed N] [--threads N] [--cross-check] [options]
 kickmix-engine cache {info,prune,clear} [--cache-dir DIR]
 kickmix-engine doctor [--json] [--manifest PATH_OR_URL]
 python -m kickmix_engine ...    # same thing
@@ -93,7 +97,10 @@ python -m kickmix_engine ...    # same thing
   compared, on PASS and on FAIL.
 - The task options mirror the official CLI's: `--m --n --degree --r --num-shots --log2-delta` for DQI, and
   `--n-p --beta --precision-bits --shots-per-x --eta --width --max-x --system-qubits` for invsqrt.
-- `--verifier PATH` selects one verifier file. If it is not given, the engine uses `$KICKMIX_ENGINE_DQI_VERIFIER` or
+- For `dfthcsos` the options mirror the official CLI: `--factorization`, `--tree-edges`, `--format`,
+  `--shots-per-address`. `--no-fcidump-cache` always parses the FCIDUMP (as the official verifier does) and
+  `--no-low-memory` keeps the official tensor layout in the error_2 step (see [Chemistry](#chemistry-dfthcsos)).
+- `--verifier PATH` selects one verifier file (for `dfthcsos`, the package directory). If it is not given, the engine uses `$KICKMIX_ENGINE_DQI_VERIFIER` or
   `$KICKMIX_ENGINE_INVSQRT_VERIFIER`, and then `$KICKMIX_ENGINE_VERIFIERS/{dqi,invsqrt}/verify_submission_*.py`.
 - DQI input sampling: `--sampler engine` (the default) draws the inputs in Rust, reproducing the verifier's
   `sample_shots` draw for draw from NumPy's PCG64 stream. `--sampler official` calls the verifier's own `sample_shots`.
@@ -105,6 +112,34 @@ python -m kickmix_engine ...    # same thing
   features detected) to stderr. `--cross-check` output also carries `engine_kernel`. The summary itself has only the
   official verifier's fields, so it stays comparable.
 - Exit code 2 (with `{"status": "ERROR", ...}`) when `KICKMIX_ENGINE_KERNEL` names a kernel this CPU cannot run.
+
+## Chemistry (`dfthcsos`)
+
+The official chemistry verifier spends most of its time outside simulation: on the fork build, 66% of a 7.6 s
+verification parses the 128 MB FeMoCo FCIDUMP in pure Python and 10% is NumPy numerics; the 30 kickmix circuit runs are
+16%. `verify dfthcsos` therefore changes three things, each checked against the official verifier:
+
+- **Simulation** on the engine (`run_sequence`): one 256-shot engine simulator per kickmix simulator, alive across the
+  15 forward and 15 reverse circuit runs, so measurement outcomes and Toffoli counts continue exactly as in kickmix.
+  The official checks run in the official order with the official messages.
+- **FCIDUMP cache**: after the official size and SHA-256 check (which still runs every time), the parser's packed
+  float32 integrals are read from `<cache dir>/fcidump/` and expanded by the official code. The first run parses the
+  file and writes the entry (34 MB) only if a round trip reproduces the parsed arrays bit for bit.
+- **Peak memory**: the error_2 Gram tensor is moved into C order in place, which removes one 255 MiB copy that the
+  official `norm(h2_delta.ravel())` makes. Values are moved, not recomputed.
+
+Everything else (loading, hashing and seeding, register rules, DF-THC metrics, costs, score, summary) is the official
+code. Measured on an Apple M2 Pro (load average 1.3-2.7, recorded per run), one process per verification, against
+the official verifier on the kickmix-macos 0.3.0 fork. Times are the `verify()` call (the whole process takes about
+0.24 s more, mostly imports); medians of 3 runs (mean of 2 for the sample); every run returned the identical summary:
+
+| submission | official | engine warm, 10 threads | engine warm, 1 thread | engine cold, 10 / 1 threads | peak footprint, official / engine warm |
+| --- | --- | --- | --- | --- | --- |
+| 998607123fc8 (N=76, R=8, B=143; 78,080 shots) | 7.30 s | 1.06 s (6.9x) | 2.03 s (3.6x) | 5.97 / 6.96 s | 1,320 / 895 MiB |
+| sample_submission (R=65, B=60; 254,464 shots) | 15.25 s | 2.47 s (6.2x) | 7.45 s (2.0x) | not measured | 2,368 / 1,731 MiB |
+
+"Cold" means an empty cache: the FCIDUMP is parsed as in the official verifier, so the gain is small. Kaggle CPU
+figures are not measured yet.
 
 ## Kernels (x86_64)
 
@@ -207,6 +242,8 @@ Parity record (all on the circuits named above; the oracle is the unmodified off
 | DQI task parity | 2 circuits x 3 salts: every summary field and all 400 per-batch results identical |
 | `reaction_depth` | equal to kickmix's `Circuit.reaction_depth()` on both DQI circuits, two invsqrt circuits and thousands of random circuits covering every op kind |
 | x86_64 kernels (0.4.0) | baseline and avx2, each forced in turn, on an x86_64 macOS build under Rosetta 2: invsqrt per-shot parity (106,496 shots) and DQI per-shot parity on 4ee7a17b4cbc (2,048 shots, controls mismatch), 0 mismatches; DQI `--cross-check` at salt-check-1 equal on every field against the official verifier on the same x86_64 interpreter. In CI on GitHub's Linux runner (AMD EPYC 9V74, Zen 4, AVX-512), the test suite (13 tests, including random-circuit parity against stored kickmix references and the sampler restatement) passes with each of baseline, avx2 and avx512 forced, on Python 3.12 and 3.13 |
+| dfthcsos per-shot parity (0.5.0) | 4 families (3 public frontier submissions and the sample) at 64 shots per address, plus 3 runs with partly used 256-shot simulators (1 and 3 shots per address): every qubit, classical bit, phase flip, register value, workspace flag and per-kind count after each of the 20 or 30 circuit runs equal to the official loop on kickmix; wrong-seed and fresh-simulator-per-step controls mismatch. Repeated under Rosetta 2 with the x86_64 build (baseline and avx2 kernels) against kickmix 1.0.0 from PyPI |
+| dfthcsos task parity (0.5.0) | `--cross-check` on the 4 families x 2 salts (PASS, every field equal) and on 11 mutated families (dirty workspace, changed selection, phase kickback, measurement-dependent word, flipped word bit, broken reverse, Z_POW, missing circuit, other family's factorization, scaled weights over the 20 mHa gates, non-zero padding), at 64 and 1 shots per address: same status and message as the official verifier |
 | FAIL paths | dirty ancilla, syndrome not restored, x not restored, dirty scratch, error-rate and phase-tolerance failures: same status and message as the official verifier |
 
 ## Reproduce the parity claims
@@ -235,6 +272,12 @@ python tests/task_parity_dqi.py g2.json --kmb $C/dqi/4ee7a17b4cbc.kmb --kmb $C/d
 python tests/reaction_depth_parity.py rd.json --random 2000 --kmb $C/dqi/4ee7a17b4cbc.kmb --kmb $C/invsqrt/07314803a092.kmb
 # FAIL paths: small mutated circuits built from the official reference circuits, through --cross-check
 python tests/fail_paths_crosscheck.py fail.json --scratch ./scratch
+# dfthcsos per-shot parity of every circuit run against the official loop (plus negative controls)
+python tests/parity_dfthcsos.py g1_chem.json --family /path/to/sample_submission/dfthcsos --family $C/chemistry/998607123fc8
+# dfthcsos --cross-check on real and mutated families (PASS and FAIL paths)
+python tests/task_parity_dfthcsos.py g2_chem.json --verifier $KICKMIX_ENGINE_VERIFIERS/dfthcsos --scratch ./scratch \
+    --cache-dir ./kme-cache --family $C/chemistry/998607123fc8 --mutate-from $C/chemistry/998607123fc8 \
+    --mutate-sample /path/to/sample_submission/dfthcsos --salts ,s1
 # Any circuit, any salt
 kickmix-engine verify dqi your.kmb --salt anything --cross-check
 ```
@@ -246,6 +289,11 @@ pip install pytest
 pytest            # from the repository root; needs only the installed wheel (no kickmix, no competition files)
 ```
 
+`tests/test_dfthcsos.py` checks `run_sequence` (the chemistry simulator loop) against chained single runs, partly used
+simulators and wide registers without kickmix; with kickmix installed it also compares it with kickmix's Simulator
+shot for shot, and with `KICKMIX_ENGINE_VERIFIERS` set it checks the FCIDUMP cache and the full chemistry
+verification against the official one (on the sample submission, or `KICKMIX_ENGINE_DFTHCSOS_FAMILY`). Tests whose
+inputs are missing are skipped.
 `tests/test_engine.py` checks the simulator against a stored kickmix reference for a random circuit over every op
 kind. It also covers the program cache (round trip and corruption detection), `reaction_depth` against stored kickmix
 values, and the DQI sampler against a NumPy restatement of `sample_shots`. `tests/test_rng.py` compares the random
@@ -266,19 +314,23 @@ skipped. The parity scripts below honour the same variable.
 - **Simulator** (`src/sim.rs`, `src/engine.rs`): 256 shots per group of four 64-bit words per qubit or bit. It follows
   kickmix's semantics: condition stack, 128-bit fixed-point angles, global phase, HMR/R outcomes from kickmix's random
   number chain (std::seed_seq, mt19937_64, then ChaCha8 keys per 256-shot simulator) and exact per-kind operation
-  counts. Batches run in parallel with Rayon, and the GIL is released while they run.
+  counts. Batches run in parallel with Rayon, and the GIL is released while they run. `run_sequence` keeps each
+  256-shot simulator alive across several programs (the chemistry task's 30 circuit runs).
 - **Compiler** (`src/program.rs`): streams a `.kmb` file into a compact u32 instruction stream, with compacted
   classical-bit ids and runs of plain CX. In the same pass it computes kickmix's `reaction_depth`, which is stored
   with the cached program.
 - **DQI sampler** (`src/dqi_sample.rs`): an exact re-implementation of the verifier's `sample_shots` on NumPy's PCG64
   stream, fused with the simulation.
-- **Task adapters** (`python/kickmix_engine/dqi.py`, `invsqrt.py`): load the official verifier module and use its
-  seeds, problem spec, reference tables, Clopper-Pearson bound, repetition factor and cost model unchanged.
+- **Task adapters** (`python/kickmix_engine/dqi.py`, `invsqrt.py`, `dfthcsos.py`): load the official verifier module
+  and use its seeds, problem spec, reference tables, Clopper-Pearson bound, repetition factor, DF-THC metrics and cost
+  model unchanged.
 
 ## Limitations
 
-- Only the invsqrt and DQI tasks. Chemistry (`dfthcsos`) is not supported.
-- Only `.kmb` input and `--batch-size 256`. DEBUG_PRINT ops are rejected. Qubit ids must be below 65,536.
+- invsqrt and DQI: only `.kmb` input and `--batch-size 256`. dfthcsos: `.kmb` directories use the program cache;
+  `.kmx` files and in-memory circuits are compiled from kickmix's text form; word registers wider than 62 bits are
+  not supported. The chemistry speed-up depends on the FCIDUMP cache: the first run on a machine parses the file
+  as the official verifier does. DEBUG_PRINT ops are rejected. Qubit ids must be below 65,536.
 - kickmix must be importable, because the official verifier modules import it.
 - `circuit_sha256` is the SHA-256 of the file bytes. The official verifier hashes kickmix's re-serialisation of the
   circuit. The two are equal for canonical `.kmb` files (as written by kickmix), and `--cross-check` compares them on
@@ -290,7 +342,8 @@ skipped. The parity scripts below honour the same variable.
   Rosetta 2). The AVX-512 kernel has passed the CI test suite on an AMD Zen 4 runner but not yet the full per-shot DQI
   parity run, and Kaggle's CPU notebooks (Broadwell-class Xeon) have no AVX-512. Check `test_status.per_kernel` in the
   release manifest before relying on a kernel.
-- Speed and memory have been measured on one Apple Silicon machine and on Kaggle's CPU notebooks, for one DQI circuit.
+- Speed and memory have been measured on one Apple Silicon machine and on Kaggle's CPU notebooks, for one DQI circuit,
+  and (0.5.0) on the Apple Silicon machine only for chemistry.
   Other machines, circuits and salts may differ; `verify --timing` reports what you get.
 
 ## Licence

@@ -28,7 +28,7 @@ Apache-2.0, with this attribution. tests/chachakeys.cc restates the key
 derivation with the C++ standard library as a test reference.
 
 Official verifier logic. The task adapters (python/kickmix_engine/dqi.py,
-invsqrt.py) load the competition's official verifier modules at run time and
+invsqrt.py, dfthcsos.py) load the competition's official verifier modules at run time and
 call their functions, and the CLI's --cross-check runs the official verifier
 CLI; the verifiers are not included in this repository. Error messages are
 reproduced from the verifiers' text so that outputs can be compared field by
@@ -38,6 +38,10 @@ loaded from the user's verifiers directory. The DQI sampler (src/dqi_sample.rs)
 re-implements the behaviour of the official `sample_shots`, and
 tests/test_engine.py restates that function for testing. The official verifiers
 are Copyright Google LLC, licensed under the Apache License, Version 2.0.
+python/kickmix_engine/dfthcsos.py restates the control flow of the dfthcsos
+verifier's verify(), load_inputs() and recover_words_from_circuits() (its checks,
+their order and their messages) around the engine, and reads the FCIDUMP
+integrals through a cache built from the official load_reference() output.
 
 NumPy algorithms. src/dqi_sample.rs re-implements, to reproduce NumPy's output
 exactly, the algorithms of NumPy's PCG64 bit generator (the PCG XSL-RR 128/64
