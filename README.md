@@ -181,7 +181,18 @@ returned the identical result.
 | 1 | 488.4 s / 4,579 MiB | 175.3 s / 1,907 MiB | 79.6 s / 316 MiB | 79.4 s / 315 MiB | 2.2x | 6.2x |
 | 4 | 282.7 s / 4,552 MiB | 87.0 s / 1,888 MiB | 41.7 s / 341 MiB | 41.2 s / 330 MiB | 2.1x | 6.9x |
 
-A per-kernel comparison (baseline vs AVX2) on the same Kaggle hardware with 0.4.0 is in progress and will be added here.
+**Kernels on Kaggle (engine 0.4.0, same hardware, second session; every kernel forced in turn; all 20 runs returned
+the identical result).** The AVX2 kernel, which the engine selects automatically on this CPU, is 1.42x faster than
+the baseline kernel at 4 threads:
+
+| workers / threads | kickmix-macos 0.3.0 | engine baseline (cold / warm) | engine avx2 (cold / warm) | avx2 warm vs fork |
+| --- | --- | --- | --- | --- |
+| 1 | 167.7 s | 78.2 / 76.6 s | 61.7 / 60.7 s | 2.8x |
+| 4 | 72.1 s | 40.0 / 38.7 s | 28.5 / 27.2 s | 2.7x |
+
+Against kickmix 1.0.0 (first session's figures) that is roughly 8-10x; the fork's own time moved between the two
+sessions (87.0 s vs 72.1 s at 4 workers), so treat cross-session ratios as approximate. Kaggle's CPU notebooks have no
+AVX-512, so that kernel's speed is not measured here.
 
 Parity record (all on the circuits named above; the oracle is the unmodified official verifier on kickmix):
 
