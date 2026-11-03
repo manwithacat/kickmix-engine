@@ -3,8 +3,17 @@
     kickmix-engine verify dqi CIRCUIT.kmb [--salt S] [--threads N] [--cross-check] ...
     kickmix-engine verify invsqrt CIRCUIT.kmb [--salt S] [--threads N] [--cross-check] ...
     kickmix-engine verify dfthcsos SUBMISSION_DIR [--salt S] [--threads N] [--cross-check] ...
+    kickmix-engine diff TASK BASE.kmb CANDIDATE.kmb [--profile P.json] [--n 16] [--draws N] [--anchor HASH] ...
+    kickmix-engine profile TASK BASE.kmb --out DIR [--draws N] [--anchor HASH] [--salt-format sweep-{}] ...
     kickmix-engine cache info|prune|clear [--cache-dir DIR]
     kickmix-engine doctor [--json] [--manifest PATH_OR_URL]
+
+`diff` compares two circuits of any task (`generic` for a circuit without a verifier) in three layers: structural
+(op-level alignment, hunks, static deltas, register interface), semantic (both circuits on identical inputs and
+simulator seeds; per-shot interface-state, phase and verdict agreement; the per-shot Toffoli change +- SE) and, with
+`--profile`, a predicted expected cost through the task plug-in with the failing-shot precondition. `profile` records
+a base's per-batch Toffolis and failing shots over a draw set once, for every later `diff --profile`. Both print JSON;
+neither is a verified score (see python/kickmix_engine/diff.py).
 
 `verify` prints the official verifier's summary JSON (same fields, including `reaction_depth`) and exits 0 on PASS,
 1 on FAIL ({"status": "FAIL", "error": ...}), like the official CLI. The official
@@ -167,6 +176,73 @@ def cmd_verify(a):
     return 0 if (not diffs and rc == 0) else (3 if diffs else rc)
 
 
+def _draws(a):
+    from .diff import DrawSet
+    return DrawSet(anchor=a.anchor, salt_format=a.salt_format, count=a.draws)
+
+
+def _plugin_spec(a):
+    spec = {}
+    if getattr(a, 'inputs', None):
+        spec['inputs'] = [x for x in a.inputs.split(',') if x]
+    if getattr(a, 'batches_per_draw', None):
+        spec['batches_per_draw'] = a.batches_per_draw
+    return spec
+
+
+def cmd_diff(a):
+    from .diff import diff, diff_family, write_new
+    a.verifier = _verifier_path(a.task, a.verifier) if a.task != 'generic' else None
+    cache = ProgramCache(a.cache_dir, enabled=not a.no_cache)
+    if a.task == 'dfthcsos' and os.path.isdir(a.base):
+        rep = diff_family(a.base, a.candidate, verifier_path=a.verifier, threads=a.threads, cache=cache,
+                          structural_layer=not a.no_structural)
+        if a.out:
+            write_new(a.out, rep)
+        from .diff import _json_default
+        print(json.dumps(rep, indent=1, default=_json_default))
+        return 0
+    if a.task == 'dfthcsos':
+        a.task = 'generic'  # single ANGLE_k circuits pair generically (uniform inputs on their registers)
+    rep = diff(a.task, a.base, a.candidate, verifier_path=a.verifier, draws=None if a.profile else _draws(a), n=a.n,
+               profile_json=a.profile, threads=a.threads, structural_layer=not a.no_structural,
+               semantic_layer=not a.no_semantic, compare_state=not a.no_state, sweep=a.sweep,
+               report_n=[int(x) for x in a.report_n.split(',')] if a.report_n else None, cache=cache,
+               spec=_plugin_spec(a))
+    if not a.full:
+        rep = dict(rep)
+        if 'prediction' in rep:
+            rep['prediction'] = {k: v for k, v in rep['prediction'].items() if k not in ('paired', 'predicted_per_draw')}
+        if 'structural' in rep:
+            rep['structural'] = dict(rep['structural'], hunks=rep['structural']['hunks'][:a.show_hunks])
+        if 'semantic' in rep:
+            rep['semantic'] = dict(rep['semantic'], disagreements=rep['semantic']['disagreements'][:a.show_hunks])
+    if a.out:
+        write_new(a.out, rep)
+    from .diff import _json_default
+    print(json.dumps(rep, indent=1, default=_json_default))
+    return 0
+
+
+def cmd_profile(a):
+    from .diff import Circuit, profile, write_new
+    from .plugins import make_plugin
+    a.verifier = _verifier_path(a.task, a.verifier) if a.task != 'generic' else None
+    cache = ProgramCache(a.cache_dir, enabled=not a.no_cache)
+    plugin = make_plugin(a.task, a.verifier, **_plugin_spec(a))
+    circ = Circuit(a.base, plugin, cache)
+    out = os.path.join(a.out, f'profile-{circ.sha[:12]}.json')
+    if os.path.exists(out):
+        print(json.dumps({'status': 'ERROR', 'error': f'refusing to overwrite {out}'}))
+        return 1
+    prof = profile(plugin, circ, _draws(a), threads=a.threads, chunk=a.chunk,
+                   log=lambda m: print(m, file=sys.stderr, flush=True))
+    prof['rerun'] = ' '.join(['kickmix-engine'] + sys.argv[1:])
+    write_new(out, prof)
+    print(json.dumps({k: prof[k] for k in prof if k != 'draws'} | {'out': out}, indent=1, default=str))
+    return 0
+
+
 def cmd_cache(a):
     c = ProgramCache(a.cache_dir)
     if a.action == 'info':
@@ -218,6 +294,35 @@ def main(argv=None):
     g.add_argument('--precision-bits', type=int, default=24); g.add_argument('--shots-per-x', type=int)
     g.add_argument('--eta', type=int); g.add_argument('--width', type=int); g.add_argument('--max-x', type=int)
     g.add_argument('--system-qubits', type=int)
+    tasks = ('dqi', 'invsqrt', 'dfthcsos', 'generic')
+    for name, help_ in (('diff', 'compare two circuits: structural, semantic (paired run), predicted cost'),
+                        ('profile', "record a base circuit's per-batch Toffolis and failing shots over a draw set")):
+        p = sub.add_parser(name, help=help_)
+        p.add_argument('task', choices=tasks)
+        p.add_argument('base', help='.kmb circuit (the base)')
+        if name == 'diff':
+            p.add_argument('candidate', help='.kmb circuit to compare against the base')
+            p.add_argument('--profile', default=None, help="the base's profile JSON (enables the cost prediction)")
+            p.add_argument('--n', type=int, default=16, help='paired batches on the fixed schedule (default 16)')
+            p.add_argument('--report-n', default=None, help='comma list of schedule prefixes to report too')
+            p.add_argument('--sweep', default=None, help="candidate's stored full sweep (gate JSON or draws CSV) to compare")
+            p.add_argument('--no-structural', action='store_true')
+            p.add_argument('--no-semantic', action='store_true')
+            p.add_argument('--no-state', action='store_true', help='skip the per-shot interface-state comparison (no dump)')
+            p.add_argument('--show-hunks', type=int, default=50, help='hunks and disagreements printed (default 50)')
+            p.add_argument('--full', action='store_true', help='print every hunk, paired unit and per-draw prediction')
+        else:
+            p.add_argument('--chunk', type=int, default=100, help='batches per engine call')
+        p.add_argument('--out', default=None, help='diff: JSON file to write (new file only); profile: directory')
+        p.add_argument('--draws', type=int, default=1, help='draws in the draw set (default 1; the project uses 48)')
+        p.add_argument('--anchor', default=None, help="hash the draw seeds are derived from (default: the base's hash)")
+        p.add_argument('--salt-format', default='sweep-{}', help="salt per draw, e.g. 'sweep-{}' ('' = the official default seed)")
+        p.add_argument('--inputs', default=None, help='generic: comma list of input registers (default: all)')
+        p.add_argument('--batches-per-draw', type=int, default=None, help='generic: batches per draw (default 16)')
+        p.add_argument('--verifier', default=None)
+        p.add_argument('--threads', type=int, default=4)
+        p.add_argument('--cache-dir', default=None)
+        p.add_argument('--no-cache', action='store_true')
     c = sub.add_parser('cache', help='inspect or clear the program cache')
     c.add_argument('action', choices=('info', 'prune', 'clear'))
     c.add_argument('--cache-dir', default=None)
@@ -228,6 +333,10 @@ def main(argv=None):
     if a.cmd == 'doctor':
         from .doctor import main as doctor_main
         return doctor_main(a)
+    if a.cmd == 'diff':
+        return cmd_diff(a)
+    if a.cmd == 'profile':
+        return cmd_profile(a)
     return cmd_verify(a) if a.cmd == 'verify' else cmd_cache(a)
 
 

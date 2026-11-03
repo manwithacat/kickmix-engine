@@ -231,6 +231,9 @@ pub struct BatchOut {
     pub val_err: Vec<u64>,
     /// [batch][4] phase flipped (kickmix `read_phase_flipped_across_shots`).
     pub phase: Vec<u64>,
+    /// [batch][256] final phase per shot in units of 2^-64 turns (the invsqrt verifier's rounding of the exact
+    /// 128-bit phase, flip included), so two circuits can be compared phase for phase.
+    pub units: Vec<u64>,
     /// [batch][NCOUNT]
     pub kind_counts: Vec<u64>,
     /// [batch][129]
@@ -266,6 +269,7 @@ pub fn run_batches(spec: &BatchSpec) -> Result<BatchOut, String> {
 
     let mut val_err = vec![0u64; nb * 4];
     let mut phase = vec![0u64; nb * 4];
+    let mut units = vec![0u64; nb * 256];
     let mut kind_counts = vec![0u64; nb * NCOUNT];
     let mut z_levels = vec![0u64; nb * 129];
     let (mut dump_q, mut dump_bits) = (Vec::new(), Vec::new());
@@ -274,6 +278,7 @@ pub fn run_batches(spec: &BatchSpec) -> Result<BatchOut, String> {
         dump_bits = vec![0u64; nb * ncb * 4];
     }
     let (pv, pp, pk, pz) = (SP(val_err.as_mut_ptr()), SP(phase.as_mut_ptr()), SP(kind_counts.as_mut_ptr()), SP(z_levels.as_mut_ptr()));
+    let pu = SP(units.as_mut_ptr());
     let (pdq, pdb) = (SP(dump_q.as_mut_ptr()), SP(dump_bits.as_mut_ptr()));
     let errs: Vec<String> = pool(spec.threads).install(|| {
         (0..nb)
@@ -293,6 +298,11 @@ pub fn run_batches(spec: &BatchSpec) -> Result<BatchOut, String> {
                     for w in 0..4 {
                         *pv.p().add(b * 4 + w) = bad.0[w];
                         *pp.p().add(b * 4 + w) = ph.0[w];
+                    }
+                    for sh in 0..256 {
+                        let f = (sim.phase.0[sh / 64] >> (sh % 64)) & 1;
+                        let v = sim.angles[sh] ^ ((f as u128) << 127);
+                        *pu.p().add(b * 256 + sh) = (((v >> 63) + 1) >> 1) as u64;
                     }
                     for k in 0..NCOUNT {
                         *pk.p().add(b * NCOUNT + k) = kc[k];
@@ -320,7 +330,7 @@ pub fn run_batches(spec: &BatchSpec) -> Result<BatchOut, String> {
     if let Some(e) = errs.into_iter().next() {
         return Err(e);
     }
-    Ok(BatchOut { val_err, phase, kind_counts, z_levels, dump_q, dump_bits })
+    Ok(BatchOut { val_err, phase, units, kind_counts, z_levels, dump_q, dump_bits })
 }
 
 /// One 256-shot batch: kickmix `Simulator(batch_size=256, seed)`, bit-sliced inputs written, circuit run.

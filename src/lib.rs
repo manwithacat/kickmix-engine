@@ -1,5 +1,6 @@
 //! kickmix-engine: bit-sliced CPU simulator core, per-shot compatible with kickmix.
 //! Written by an AI model (Claude) under the owner's direction; semantics follow kickmix (Apache-2.0, Google LLC).
+pub mod diff;
 pub mod dqi_sample;
 pub mod engine;
 pub mod kernel;
@@ -175,12 +176,59 @@ fn run_batches<'py>(
     let d = PyDict::new(py);
     d.set_item("val_err", PyArray1::from_vec(py, out.val_err))?;
     d.set_item("phase", PyArray1::from_vec(py, out.phase))?;
+    d.set_item("phase_units", PyArray1::from_vec(py, out.units))?;
     d.set_item("kind_counts", PyArray1::from_vec(py, out.kind_counts))?;
     d.set_item("z_levels", PyArray1::from_vec(py, out.z_levels))?;
     if dump {
         d.set_item("dump_q", PyArray1::from_vec(py, out.dump_q))?;
         d.set_item("dump_bits", PyArray1::from_vec(py, out.dump_bits))?;
     }
+    Ok(d)
+}
+
+/// Structural diff of two .kmb files (see `diff.rs`): op-level alignment, hunks with per-kind and Toffoli deltas,
+/// static counts and registers of both sides. The GIL is released while the files stream.
+#[pyfunction]
+#[pyo3(signature = (path_a, path_b, k=16, sample_bits=6, max_hunks=1000))]
+fn structural_diff<'py>(py: Python<'py>, path_a: String, path_b: String, k: usize, sample_bits: u32, max_hunks: usize) -> PyResult<Bound<'py, PyDict>> {
+    if k < 2 || sample_bits > 20 {
+        return Err(PyValueError::new_err("k must be >= 2 and sample_bits <= 20"));
+    }
+    let opts = diff::DiffOpts { k, sample_bits, max_hunks };
+    let out = py.detach(|| diff::structural_diff(&path_a, &path_b, &opts)).map_err(PyValueError::new_err)?;
+    let side = |s: &diff::Side| -> PyResult<Bound<'py, PyDict>> {
+        let d = PyDict::new(py);
+        d.set_item("num_ops", s.num_ops)?;
+        d.set_item("num_qubits", s.num_qubits)?;
+        d.set_item("num_bits", s.num_bits)?;
+        d.set_item("qubits_touched", s.qubits_touched)?;
+        d.set_item("static_counts", s.kinds.to_vec())?;
+        d.set_item("registers", s.registers.clone())?;
+        Ok(d)
+    };
+    let d = PyDict::new(py);
+    d.set_item("a", side(&out.a)?)?;
+    d.set_item("b", side(&out.b)?)?;
+    d.set_item("identical", out.identical)?;
+    d.set_item("common_prefix", out.common_prefix)?;
+    d.set_item("common_suffix", out.common_suffix)?;
+    d.set_item("matched_ops", out.matched_ops)?;
+    d.set_item("num_hunks", out.num_hunks)?;
+    d.set_item("anchors", out.anchors)?;
+    let hunks: Vec<Bound<'py, PyDict>> = out
+        .hunks
+        .iter()
+        .map(|h| {
+            let hd = PyDict::new(py);
+            hd.set_item("a", (h.a_start, h.a_end))?;
+            hd.set_item("b", (h.b_start, h.b_end))?;
+            hd.set_item("a_kinds", h.a_kinds.to_vec())?;
+            hd.set_item("b_kinds", h.b_kinds.to_vec())?;
+            hd.set_item("toffoli_delta", h.toffoli_delta())?;
+            Ok(hd)
+        })
+        .collect::<PyResult<_>>()?;
+    d.set_item("hunks", hunks)?;
     Ok(d)
 }
 
@@ -356,6 +404,7 @@ fn _engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(derive_keys, m)?)?;
     m.add_function(wrap_pyfunction!(run, m)?)?;
     m.add_function(wrap_pyfunction!(run_batches, m)?)?;
+    m.add_function(wrap_pyfunction!(structural_diff, m)?)?;
     m.add_function(wrap_pyfunction!(sample_dqi, m)?)?;
     m.add_function(wrap_pyfunction!(run_dqi, m)?)?;
     m.add_function(wrap_pyfunction!(run_sequence, m)?)?;

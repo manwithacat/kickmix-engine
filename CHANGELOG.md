@@ -3,6 +3,47 @@
 All notable changes to kickmix-engine. Dates are UTC. The project was written by an AI model (Claude) under the
 owner's direction; see NOTICE.
 
+## Unreleased (branch `paired-runner`, 2026-11-03)
+
+### Added
+- **`kickmix-engine diff TASK BASE CANDIDATE`** (`kickmix_engine.diff.diff`): compare any two kickmix circuits in
+  three layers. (1) *Structural* (`_engine.structural_diff`, Rust, no simulation): op-level alignment in file order
+  (common prefix streamed in lockstep, common suffix from 64-bit op hashes, the middle aligned with content-defined
+  k-gram anchors extended op by op), the changed regions as hunks with per-kind and Toffoli deltas, static counts,
+  qubits, bits and a register-interface check; 56M-op DQI circuits diff in about 4-8 s at under 300 MiB.
+  (2) *Semantic* (`kickmix_engine.pair.pair_run`): both circuits on identical inputs and simulator seeds over a fixed
+  schedule of batches; per shot the interface-state, phase (exact, in 2^-64 turns) and acceptance-verdict agreement,
+  per paired unit the Toffolis executed on each side, in aggregate the per-shot mean Toffoli change with its standard
+  error and a bounded disagreement list. (3) *Cost prediction* (`--profile`): the candidate's expected cost over a
+  base profile's draw set through the task plug-in's price model, with the failing-shot precondition checked on the
+  base's failing batches and every paired batch. Output is JSON; `--out` writes a new file only.
+- **`kickmix-engine profile TASK BASE --out DIR`** (`kickmix_engine.diff.profile`): one pass over a draw set
+  recording every batch's Toffolis and failing shots, reused by every later `diff --profile`. Draw sets are
+  `--draws N --anchor HASH --salt-format 'sweep-{}'`: seeds `_initial_seed(anchor, salt)`, so with a fixed anchor two
+  circuits pair draw for draw. The JSON schema is the one the VQCC project's `scripts/dqi_fast_rank.py` wrote, which
+  is now a thin wrapper over this module.
+- **Task plug-ins** (`kickmix_engine.plugins`): one small class per task supplies the input interface (from the
+  register table, with the official rules), the draw/batch structure, the input sampler, the per-shot acceptance
+  check and the price model; everything else is shared. `dqi` (engine `sample_shots`, value/phase verdicts,
+  R(k) x Q^2 x mean Toffolis), `invsqrt` (chunked simulators, the official `reference_values` tolerance per x,
+  margins, the rotation-cost rule from the smallest margin), `dfthcsos` (family-level: both submissions verified
+  by the official pipeline on the engine, ANGLE_k circuits diffed structurally) and `generic` (any circuit:
+  uniform inputs on named registers or explicit `qubits=`, restore check only, Q x mean Toffolis).
+- `run_batches` returns `phase_units` [n, 256]: each shot's final phase in units of 2^-64 turns (flip included,
+  the invsqrt verifier's rounding). Existing keys are unchanged.
+- `program::KmbOps`: a pull iterator over the ops of a .kmb file (`SrcOp` with original ids and a content hash);
+  `Program::from_kmb` now consumes it, so parsing has one implementation.
+- Tests: `tests/test_diff.py` (structural diff on the fixture and byte-mutated copies, the generic paired runner
+  on a self pair and a mutant, the pure helpers). All run without kickmix.
+
+### Parity (VQCC project card `experiments/2026-11-03-engine-general-paired-runner.md`)
+- `diff dqi --profile` reproduced the project's five `dqi_fast_rank.py` validation predictions exactly (predicted
+  cost, Toffoli change and its SE, precondition verdict, every paired Toffoli total).
+- The invsqrt plug-in reproduced the official verifier's summary on two frontier circuits (score, Toffoli mean,
+  T count, rotations, eps, worst error/tolerance and worst x) through both the adapter and the profile path.
+- A deliberately broken rewrite (one CX turned into a CZ, Toffoli-neutral) was isolated by the structural layer and
+  failed by the semantic layer; the genuine rewrite agreed on every shot.
+
 ## 0.5.0 (2026-10-28)
 
 ### Added

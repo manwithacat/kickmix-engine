@@ -637,6 +637,93 @@ impl Program {
 
     /// Compile a .kmb file by streaming its arrays (no full copy of the circuit is held).
     pub fn from_kmb(path: &str) -> Result<Program, String> {
+        let mut ops = KmbOps::open(path)?;
+        let num_ops = ops.num_ops as usize;
+        let mut bld = Builder::new(num_ops + num_ops / 4);
+        while let Some(op) = ops.next()? {
+            if op.kind == K_INFO {
+                bld.info_tag();
+            } else {
+                bld.op(op.kind, op.cond, op.qubits(), op.bit, op.angle)?;
+            }
+        }
+        let (num_qubits, num_bits, registers) = (ops.num_qubits, ops.num_bits, std::mem::take(&mut ops.registers));
+        let prog = bld.finish(num_qubits, num_bits, registers);
+        if prog.num_qubits != num_qubits || prog.orig_num_bits != num_bits {
+            return Err(format!(
+                "header num_qubits/num_bits {}/{} disagree with ops and registers {}/{}",
+                num_qubits, num_bits, prog.num_qubits, prog.orig_num_bits
+            ));
+        }
+        Ok(prog)
+    }
+}
+
+/// One source op of a .kmb file in file order (original qubit and bit ids). `kind == K_INFO` is an INFO_TAG.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SrcOp {
+    pub kind: u8,
+    pub nq: u8,
+    pub qs: [u32; 3],
+    /// Condition bit (`*_IF` ops) or PUSH_CONDITION's bit.
+    pub cond: Option<u32>,
+    /// Bit target of BIT_STORE0/1, BIT_INVERT and HMR.
+    pub bit: Option<u32>,
+    /// Z_POW angle V = turns * 2^128 mod 2^128.
+    pub angle: Option<u128>,
+}
+
+impl SrcOp {
+    pub fn qubits(&self) -> &[u32] {
+        &self.qs[..self.nq as usize]
+    }
+    /// A 64-bit content hash of the op (kind, operands, condition, bit target and angle), used by `diff`.
+    pub fn hash(&self) -> u64 {
+        #[inline]
+        fn mix(mut h: u64, x: u64) -> u64 {
+            h ^= x.wrapping_add(0x9e37_79b9_7f4a_7c15).wrapping_add(h << 6).wrapping_add(h >> 2);
+            h = (h ^ (h >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            h ^ (h >> 27)
+        }
+        let mut h = mix(0x243f_6a88_85a3_08d3, self.kind as u64 | ((self.nq as u64) << 8));
+        for &q in self.qubits() {
+            h = mix(h, q as u64 + 1);
+        }
+        h = mix(h, self.cond.map_or(0, |c| c as u64 + 1));
+        h = mix(h, self.bit.map_or(0, |b| b as u64 + 1));
+        if let Some(a) = self.angle {
+            h = mix(h, a as u64);
+            h = mix(h, (a >> 64) as u64);
+        }
+        h
+    }
+}
+
+/// Pull iterator over the ops of a .kmb file (version 2), validating the packet layout up front as `from_kmb`
+/// always did; `next()` returns the ops in file order and checks the operand arrays are fully consumed at the end.
+pub struct KmbOps {
+    pub num_qubits: usize,
+    pub num_bits: usize,
+    pub num_ops: u64,
+    pub registers: Vec<(String, Vec<(bool, u32)>)>,
+    types: BufReader<File>,
+    tbuf: Vec<u8>,
+    tpos: usize,
+    tlen: usize,
+    done: u64,
+    qqq: [ArrReader; 3],
+    qq: [ArrReader; 2],
+    q0: ArrReader,
+    b0: ArrReader,
+    bc: ArrReader,
+    ang: BufReader<File>,
+    n_ang: u64,
+    n_ang_used: u64,
+    finished: bool,
+}
+
+impl KmbOps {
+    pub fn open(path: &str) -> Result<KmbOps, String> {
         let f = File::open(path).map_err(|e| e.to_string())?;
         let file_len = f.metadata().map_err(|e| e.to_string())?.len();
         let mut r = BufReader::with_capacity(1 << 20, f);
@@ -702,94 +789,114 @@ impl Program {
         }
         let mut types = BufReader::with_capacity(1 << 20, File::open(path).map_err(|e| e.to_string())?);
         types.seek(SeekFrom::Start(offs[0])).map_err(|e| e.to_string())?;
-        let mut qqq = [ArrReader::open(path, offs[1], n_qqq)?, ArrReader::open(path, offs[2], n_qqq)?, ArrReader::open(path, offs[3], n_qqq)?];
-        let mut qq = [ArrReader::open(path, offs[4], n_qq)?, ArrReader::open(path, offs[5], n_qq)?];
-        let mut q0 = ArrReader::open(path, offs[6], n_q)?;
-        let mut b0 = ArrReader::open(path, offs[7], n_b)?;
-        let mut bc = ArrReader::open(path, offs[8], n_c)?;
+        let qqq = [ArrReader::open(path, offs[1], n_qqq)?, ArrReader::open(path, offs[2], n_qqq)?, ArrReader::open(path, offs[3], n_qqq)?];
+        let qq = [ArrReader::open(path, offs[4], n_qq)?, ArrReader::open(path, offs[5], n_qq)?];
+        let q0 = ArrReader::open(path, offs[6], n_q)?;
+        let b0 = ArrReader::open(path, offs[7], n_b)?;
+        let bc = ArrReader::open(path, offs[8], n_c)?;
         let mut ang = BufReader::with_capacity(1 << 16, File::open(path).map_err(|e| e.to_string())?);
         ang.seek(SeekFrom::Start(offs[9])).map_err(|e| e.to_string())?;
-        let mut n_ang_used = 0u64;
+        Ok(KmbOps {
+            num_qubits,
+            num_bits,
+            num_ops,
+            registers,
+            types,
+            tbuf: vec![0u8; 1 << 20],
+            tpos: 0,
+            tlen: 0,
+            done: 0,
+            qqq,
+            qq,
+            q0,
+            b0,
+            bc,
+            ang,
+            n_ang,
+            n_ang_used: 0,
+            finished: false,
+        })
+    }
 
-        let mut bld = Builder::new((num_ops as usize) + (num_ops as usize) / 4);
-        let mut tbuf = vec![0u8; 1 << 20];
-        let mut done = 0u64;
-        while done < num_ops {
-            let n = ((num_ops - done) as usize).min(tbuf.len());
-            types.read_exact(&mut tbuf[..n]).map_err(|e| e.to_string())?;
-            for &t in &tbuf[..n] {
-                if t == 0x06 {
-                    bld.info_tag();
-                    continue;
+    /// The next op in file order, or `None` after the last one (when the operand arrays are checked for leftovers).
+    #[allow(clippy::should_implement_trait)]
+    pub fn next(&mut self) -> Result<Option<SrcOp>, String> {
+        if self.finished {
+            return Ok(None);
+        }
+        if self.tpos == self.tlen {
+            if self.done == self.num_ops {
+                self.finished = true;
+                if self.qqq.iter().any(|a| a.left != 0) || self.qq.iter().any(|a| a.left != 0) || self.q0.left != 0 || self.b0.left != 0 || self.bc.left != 0 || self.n_ang_used != self.n_ang {
+                    return Err("operand arrays not fully consumed".into());
                 }
-                let low = t & 0x0F;
-                if low == 7 {
-                    return Err("DEBUG_PRINT ops are not supported".into());
-                }
-                let has_cond = t & 0x80 != 0;
-                let nq = ((t >> 4) & 3) as usize;
-                let has_b = t & 0x40 != 0;
-                let kind = match (t & 0x7F, has_cond) {
-                    (0x00, false) => K_NEG,
-                    (0x00, true) => K_NEG,
-                    (0x01, false) => K_POP,
-                    (0x01, true) => K_PUSH,
-                    (0x40, _) => K_ST0,
-                    (0x41, _) => K_ST1,
-                    (0x42, _) => K_INV,
-                    (0x10, _) => K_Z,
-                    (0x11, _) => K_X,
-                    (0x12, _) => K_R,
-                    (0x13, _) => K_ZPOW,
-                    (0x50, _) => K_HMR,
-                    (0x20, _) => K_CZ,
-                    (0x21, _) => K_CX,
-                    (0x22, _) => K_SWAP,
-                    (0x30, _) => K_CCZ,
-                    (0x31, _) => K_CCX,
-                    (0x32, _) => K_CSWAP,
-                    _ => return Err(format!("unsupported kmb op type 0x{:02x}", t)),
-                };
-                let mut qs = [0u32; 3];
-                match nq {
-                    1 => qs[0] = q0.next()?,
-                    2 => {
-                        qs[0] = qq[0].next()?;
-                        qs[1] = qq[1].next()?;
-                    }
-                    3 => {
-                        qs[0] = qqq[0].next()?;
-                        qs[1] = qqq[1].next()?;
-                        qs[2] = qqq[2].next()?;
-                    }
-                    _ => {}
-                }
-                let bit = if has_b { Some(b0.next()?) } else { None };
-                let cond = if has_cond { Some(bc.next()?) } else { None };
-                let angle = if kind == K_ZPOW {
-                    let lo = rd_u64(&mut ang)?;
-                    let hi = rd_u64(&mut ang)?;
-                    n_ang_used += 1;
-                    // kickmix words[0] is the low word of V = turns * 2^128, words[1] the high word.
-                    Some((lo as u128) | ((hi as u128) << 64))
-                } else {
-                    None
-                };
-                bld.op(kind, cond, &qs[..nq], bit, angle)?;
+                return Ok(None);
             }
-            done += n as u64;
+            let n = ((self.num_ops - self.done) as usize).min(self.tbuf.len());
+            self.types.read_exact(&mut self.tbuf[..n]).map_err(|e| e.to_string())?;
+            self.tpos = 0;
+            self.tlen = n;
+            self.done += n as u64;
         }
-        if qqq.iter().any(|a| a.left != 0) || qq.iter().any(|a| a.left != 0) || q0.left != 0 || b0.left != 0 || bc.left != 0 || n_ang_used != n_ang {
-            return Err("operand arrays not fully consumed".into());
+        let t = self.tbuf[self.tpos];
+        self.tpos += 1;
+        if t == 0x06 {
+            return Ok(Some(SrcOp { kind: K_INFO, nq: 0, qs: [0; 3], cond: None, bit: None, angle: None }));
         }
-        let prog = bld.finish(num_qubits, num_bits, registers);
-        if prog.num_qubits != num_qubits || prog.orig_num_bits != num_bits {
-            return Err(format!(
-                "header num_qubits/num_bits {}/{} disagree with ops and registers {}/{}",
-                num_qubits, num_bits, prog.num_qubits, prog.orig_num_bits
-            ));
+        let low = t & 0x0F;
+        if low == 7 {
+            return Err("DEBUG_PRINT ops are not supported".into());
         }
-        Ok(prog)
+        let has_cond = t & 0x80 != 0;
+        let nq = ((t >> 4) & 3) as usize;
+        let has_b = t & 0x40 != 0;
+        let kind = match (t & 0x7F, has_cond) {
+            (0x00, false) => K_NEG,
+            (0x00, true) => K_NEG,
+            (0x01, false) => K_POP,
+            (0x01, true) => K_PUSH,
+            (0x40, _) => K_ST0,
+            (0x41, _) => K_ST1,
+            (0x42, _) => K_INV,
+            (0x10, _) => K_Z,
+            (0x11, _) => K_X,
+            (0x12, _) => K_R,
+            (0x13, _) => K_ZPOW,
+            (0x50, _) => K_HMR,
+            (0x20, _) => K_CZ,
+            (0x21, _) => K_CX,
+            (0x22, _) => K_SWAP,
+            (0x30, _) => K_CCZ,
+            (0x31, _) => K_CCX,
+            (0x32, _) => K_CSWAP,
+            _ => return Err(format!("unsupported kmb op type 0x{:02x}", t)),
+        };
+        let mut qs = [0u32; 3];
+        match nq {
+            1 => qs[0] = self.q0.next()?,
+            2 => {
+                qs[0] = self.qq[0].next()?;
+                qs[1] = self.qq[1].next()?;
+            }
+            3 => {
+                qs[0] = self.qqq[0].next()?;
+                qs[1] = self.qqq[1].next()?;
+                qs[2] = self.qqq[2].next()?;
+            }
+            _ => {}
+        }
+        let bit = if has_b { Some(self.b0.next()?) } else { None };
+        let cond = if has_cond { Some(self.bc.next()?) } else { None };
+        let angle = if kind == K_ZPOW {
+            let lo = rd_u64(&mut self.ang)?;
+            let hi = rd_u64(&mut self.ang)?;
+            self.n_ang_used += 1;
+            // kickmix words[0] is the low word of V = turns * 2^128, words[1] the high word.
+            Some((lo as u128) | ((hi as u128) << 64))
+        } else {
+            None
+        };
+        Ok(Some(SrcOp { kind, nq: nq as u8, qs, cond, bit, angle }))
     }
 }
 

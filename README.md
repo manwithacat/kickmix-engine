@@ -113,6 +113,61 @@ python -m kickmix_engine ...    # same thing
   official verifier's fields, so it stays comparable.
 - Exit code 2 (with `{"status": "ERROR", ...}`) when `KICKMIX_ENGINE_KERNEL` names a kernel this CPU cannot run.
 
+## The `diff` and `profile` commands
+
+Comparing two circuits is a first-class operation: `diff` works for any kickmix circuit (and any rewrite of it)
+and the task-specific parts are small plug-ins.
+
+```
+kickmix-engine diff {dqi,invsqrt,dfthcsos,generic} BASE.kmb CANDIDATE.kmb [--profile P.json] [--n 16]
+                    [--draws N --anchor HASH --salt-format 'sweep-{}'] [--threads N] [--out NEW.json] [--full]
+kickmix-engine profile {dqi,invsqrt,generic} BASE.kmb --out DIR [--draws N --anchor HASH] [--threads N]
+kickmix-engine diff dfthcsos SUBMISSION_DIR_A SUBMISSION_DIR_B      # family level
+```
+
+`diff` prints one JSON object with three layers:
+
+1. **Structural** (Rust, no simulation): op-level alignment of the two files in order. The common prefix is found
+   while both files stream in lockstep, the common suffix from 64-bit op hashes, and the middle is aligned with
+   content-defined anchors (sampled k-grams unique on both sides, chained and extended op by op). The report lists
+   the hunks (changed regions) with their op ranges, per-kind and Toffoli deltas, the static counts, qubits, bits and
+   whether the register interfaces match. Two 64M-op DQI circuits that differ at 24 sites take about 4 s and
+   240 MiB; two unrelated DQI circuits about 7 s.
+2. **Semantic** (the paired runner, `kickmix_engine.pair`): both circuits run on identical inputs and simulator seeds
+   over a fixed schedule of batches (`draw i mod draws, batch (157 i + 3) mod batches_per_draw`). Per shot: the
+   interface-state agreement, the exact phase difference (2^-64 turns), both sides' acceptance verdicts. Per paired
+   unit (a batch, or a simulator chunk for invsqrt): the Toffolis executed. In aggregate: the per-shot mean Toffoli
+   change with its standard error, agreement fractions and a bounded disagreement list. Pairing by seed means the
+   same ChaCha stream per simulator; a rewrite that keeps the measurement structure sees identical outcomes.
+3. **Cost prediction** (with `--profile`): the candidate's expected cost over the profile's draw set through the
+   plug-in's price model, assuming the candidate's failing shots equal the base's, which is checked on the base's
+   failing batches and on every paired batch (coverage is reported; unchecked shots can still differ). A profile
+   (`kickmix-engine profile`) is one full pass of the base over the draw set, recording every batch's Toffolis and
+   failing shots, written once and reused for every candidate. The VQCC project's `dqi_fast_rank.py` method
+   (48 fixed draws, N = 16 paired batches, about 5 s per candidate against a 10-minute sweep) is this layer; the
+   engine reproduced its five validation predictions exactly.
+
+A plug-in (`kickmix_engine.plugins.TaskPlugin`) supplies five things: `interface(prog, sha)` (which registers are
+inputs, by the official rules), `batches(sha, draws, i)` (the verifier's seeds and sampler states for one draw),
+`inputs(iface, batches)` (bit-sliced inputs and expected outcomes), `judge(iface, batches, inputs, out)` (per-shot
+failing shots by type, Toffolis, margins) and `price(profile_draws, Q, delta_t)`. The shipped plug-ins: `dqi`
+(engine `sample_shots`; value and phase verdicts; R(k) x Q^2 x mean Toffolis), `invsqrt` (one simulator per chunk
+of 64 batches; the official `reference_values` tolerance per x; the rotation-cost rule from the smallest margin;
+reproduces the official summary exactly on the frontier circuits), `dfthcsos` (family level: both submissions
+verified by the official pipeline on the engine, plus a structural diff per ANGLE_k circuit) and `generic` (any
+circuit: uniform random inputs on named registers or explicit `qubits=`, restore check, Q x mean Toffolis). The
+official verifier remains the only authority on a score; a predicted cost is a projection.
+
+From Python:
+
+```python
+from kickmix_engine.diff import diff, structural, profile, Circuit
+from kickmix_engine.plugins import make_plugin, DrawSet
+rep = diff("invsqrt", "base.kmb", "cand.kmb", verifier_path=V, n=16, threads=4)      # three layers as a dict
+s = structural("a.kmb", "b.kmb")                                                      # layer 1 only
+prof = profile(make_plugin("dqi", V), Circuit("base.kmb", make_plugin("dqi", V)), DrawSet(anchor=H, count=48))
+```
+
 ## Chemistry (`dfthcsos`)
 
 The official chemistry verifier spends most of its time outside simulation: on the fork build, 66% of a 7.6 s

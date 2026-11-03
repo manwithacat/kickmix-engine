@@ -96,15 +96,18 @@ def run_batches(prog: Program, seeds, qin_ids, qin, bin_ids, bin_, *, threads: i
     qin: uint64 [n, len(qin_ids), 4] bit-sliced input qubit values (bit s of word s//64 = shot s);
     bin_: uint64 [n, len(bin_ids), 4] input classical bits (compact ids, see ``Program.bit_compact``).
     Returns val_err [n, 4] (an input qubit not restored or another qubit nonzero), phase [n, 4] (phase flipped),
-    kind_counts [n, len(KINDS)], z_levels [n, 129], toffoli_count [n]; with dump=True also dump_q [n, nq, 4] and
-    dump_bits [n, num_bits, 4]. The GIL is released during simulation; concurrent calls share one thread pool.
+    phase_units [n, 256] (each shot's final phase in 2^-64 turns, uint64, flip included: the invsqrt verifier's
+    rounding), kind_counts [n, len(KINDS)], z_levels [n, 129], toffoli_count [n]; with dump=True also dump_q
+    [n, nq, 4] and dump_bits [n, num_bits, 4]. The GIL is released during simulation; concurrent calls share one
+    thread pool.
     """
     seeds = np.asarray([seed_words(x) if isinstance(x, int) else x for x in seeds], dtype=np.uint32).reshape(-1, 8)
     n = len(seeds)
     qin = np.ascontiguousarray(qin, dtype=np.uint64).reshape(-1)
     bin_ = np.ascontiguousarray(bin_, dtype=np.uint64).reshape(-1)
     r = _run_batches(prog, seeds, [int(q) for q in qin_ids], qin, [int(b) for b in bin_ids], bin_, threads, counting, dump)
-    out = dict(val_err=r["val_err"].reshape(n, 4), phase=r["phase"].reshape(n, 4))
+    out = dict(val_err=r["val_err"].reshape(n, 4), phase=r["phase"].reshape(n, 4),
+               phase_units=r["phase_units"].reshape(n, 256))
     out["kind_counts"] = kc = r["kind_counts"].reshape(n, len(KINDS))
     out["z_levels"] = r["z_levels"].reshape(n, 129)
     out["toffoli_count"] = sum(kc[:, KINDS.index(k)] for k in TOFFOLI_KINDS)
