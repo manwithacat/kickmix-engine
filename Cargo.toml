@@ -21,3 +21,6 @@ opt-level = 3
 lto = "fat"
 codegen-units = 1
 debug = false
+
+[workspace]
+members = ["crates/qrom-plan"]

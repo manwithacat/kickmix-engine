@@ -1,0 +1,16 @@
+[package]
+name = "qrom-plan"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Bit-packed GF(2) cost model for the VQCC chemistry ANGLE_k five-word QROM loaders: kernel relations, pairing, incremental word-flip pricing"
+
+[lib]
+name = "qrom_plan"
+path = "src/lib.rs"
+
+[[bin]]
+name = "qrom-plan"
+path = "src/main.rs"
+
+[dependencies]
