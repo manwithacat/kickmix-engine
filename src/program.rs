@@ -61,6 +61,8 @@ pub const Q_OFF: u32 = Q_DUMMY + N_DUMMY;
 /// Plain CX stretches at least this long are emitted as a `K_CXRUN` (its loop is cheaper than the uniform one);
 /// shorter ones join the surrounding uniform run.
 pub const CX_RUN_MIN: usize = 8;
+/// Pending uniform-kind ops are flushed when this many accumulate (bounds compile-time memory).
+pub const MAX_PENDING: usize = 1 << 16;
 
 /// Histogram slot of a uniform kind.
 pub fn uni_slot(k: u8) -> Option<usize> {
@@ -632,6 +634,11 @@ impl Builder {
         let cond_c = cond.map(|c| self.cb(c) + B_OFF);
         if uni_slot(kind).is_some() {
             self.pending.push((kind, oq, cond_c.unwrap_or(B_ONES)));
+            if self.pending.len() >= MAX_PENDING {
+                // Bound the compile-time transient (a DQI circuit has stretches of millions of plain CX); a run
+                // split at this boundary executes the same ops in the same order.
+                self.flush_pending();
+            }
             return Ok(());
         }
         self.flush_pending();
@@ -785,7 +792,10 @@ impl Program {
     pub fn from_kmb(path: &str) -> Result<Program, String> {
         let mut ops = KmbOps::open(path)?;
         let num_ops = ops.num_ops as usize;
-        let mut bld = Builder::new(num_ops + num_ops / 4);
+        // Stream words per op: 1 (CX run entry) to 3 (uniform entry, 3-word interpreter op) plus run headers;
+        // reserve 4 per op so the vector never doubles and copies (untouched capacity costs no resident memory;
+        // `finish` shrinks it).
+        let mut bld = Builder::new(num_ops * 4 + 1024);
         while let Some(op) = ops.next()? {
             if op.kind == K_INFO {
                 bld.info_tag();
