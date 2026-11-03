@@ -29,7 +29,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
-      - run: python -m pip install "kaggle>=1.7.4.5"
+      - run: python -m pip install "kaggle>=1.7.4.5" six  # kaggle imports six without declaring it (2026-11-03)
       - name: Check the token is set and accepted
         run: |
           test -n "$KAGGLE_API_TOKEN" || { echo "::error::secret KAGGLE_API_TOKEN is not set"; exit 1; }
