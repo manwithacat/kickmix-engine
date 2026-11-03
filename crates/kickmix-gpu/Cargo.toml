@@ -1,0 +1,27 @@
+[package]
+name = "kickmix-gpu"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "GPU (wgpu / Metal) shot-parallel simulator prototype for kickmix-engine programs: feasibility study, not a release component"
+publish = false
+
+# A standalone workspace root on purpose: the default kickmix-engine build, its lockfile and its offline builds do
+# not see wgpu or any of these dependencies. Build with `cargo build --release --manifest-path crates/kickmix-gpu/Cargo.toml`.
+[workspace]
+
+[[bin]]
+name = "kickmix-gpu"
+path = "src/main.rs"
+
+[dependencies]
+wgpu = "26"
+pollster = "0.4"
+bytemuck = { version = "1", features = ["derive"] }
+rayon = "1.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = 3
+debug = 1
