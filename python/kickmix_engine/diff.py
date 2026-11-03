@@ -24,7 +24,7 @@ import time
 import numpy as np
 
 from . import __version__
-from .cache import ProgramCache, load_program
+from .cache import ProgramCache, load_program, read_json
 from .pair import pair_run, public
 from .plugins import BATCH_SHOTS, Batch, DrawSet, TaskPlugin, make_plugin
 
@@ -233,7 +233,7 @@ def diff(task: str, path_a, path_b, *, verifier_path=None, draws: DrawSet | None
         rep["structural"] = structural(path_a, path_b)
     prof = None
     if profile_json:
-        prof = json.loads(open(profile_json).read())
+        prof = read_json(profile_json)
         draws = draws_of_profile(prof)
     ca = Circuit(path_a, plugin, cache)
     cb = Circuit(path_b, plugin, cache)

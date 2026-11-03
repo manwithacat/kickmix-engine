@@ -27,6 +27,107 @@ from . import _engine
 _KEY = None
 
 
+class Memory:
+    """In-process memo for a resident engine (``kickmix-engine serve``): compiled programs by content hash, the
+    hashes of files this process hashed itself (so a request for the same unchanged file skips re-reading it),
+    task plug-ins (with their reference tables) and parsed JSON files such as profiles.
+
+    A path is trusted only when its realpath, size, mtime_ns and inode equal those recorded when this process
+    computed the hash; a file rewritten with identical size, mtime_ns and inode would not be noticed, which no
+    ordinary write does. Programs are kept in an LRU of ``max_programs`` entries.
+    """
+
+    def __init__(self, max_programs=8):
+        self.max_programs = max_programs
+        self.programs = {}   # sha -> (program, last use counter)
+        self.paths = {}      # realpath -> (size, mtime_ns, ino, sha)
+        self.plugins = {}
+        self.jsons = {}      # (realpath, size, mtime_ns) -> object
+        self.stats = {'program_hits': 0, 'program_misses': 0, 'plugin_hits': 0, 'json_hits': 0, 'requests': 0}
+        self._tick = 0
+
+    def _stat(self, path):
+        rp = os.path.realpath(path)
+        st = os.stat(rp)
+        return rp, (st.st_size, st.st_mtime_ns, st.st_ino)
+
+    def lookup(self, kmb_path):
+        """(sha, program) for an unchanged file this process already hashed and still holds, else None."""
+        try:
+            rp, key = self._stat(kmb_path)
+        except OSError:
+            return None
+        rec = self.paths.get(rp)
+        if rec is None or rec[:3] != key:
+            return None
+        sha = rec[3]
+        ent = self.programs.get(sha)
+        if ent is None:
+            return None
+        self._tick += 1
+        self.programs[sha] = (ent[0], self._tick)
+        self.stats['program_hits'] += 1
+        return sha, ent[0]
+
+    def remember(self, kmb_path, sha, prog):
+        try:
+            rp, key = self._stat(kmb_path)
+        except OSError:
+            return
+        self.paths[rp] = key + (sha,)
+        self._tick += 1
+        self.programs[sha] = (prog, self._tick)
+        self.stats['program_misses'] += 1
+        while len(self.programs) > self.max_programs:
+            oldest = min(self.programs, key=lambda s: self.programs[s][1])
+            del self.programs[oldest]
+
+    def json(self, path):
+        """Parsed JSON of `path`, cached while the file's size and mtime_ns are unchanged (callers must not mutate it)."""
+        rp, key = self._stat(path)
+        k = (rp, key[0], key[1])
+        if k not in self.jsons:
+            with open(rp) as f:
+                self.jsons[k] = json.load(f)
+            for other in [o for o in self.jsons if o[0] == rp and o != k]:
+                del self.jsons[other]
+        else:
+            self.stats['json_hits'] += 1
+        return self.jsons[k]
+
+    def describe(self):
+        return dict(self.stats, programs=sorted(s[:12] for s in self.programs), plugins=len(self.plugins),
+                    jsons=len(self.jsons), program_bytes=sum(p.nbytes for p, _ in self.programs.values()))
+
+
+MEMORY = None
+
+
+def memory():
+    """The process's resident memory, or None outside ``kickmix-engine serve``."""
+    return MEMORY
+
+
+def enable_memory(max_programs=8):
+    global MEMORY
+    MEMORY = Memory(max_programs=max_programs)
+    return MEMORY
+
+
+def disable_memory():
+    global MEMORY
+    MEMORY = None
+
+
+def read_json(path):
+    """json.load(path), through the resident memory when one is active."""
+    mem = memory()
+    if mem is not None:
+        return mem.json(path)
+    with open(path) as f:
+        return json.load(f)
+
+
 def cache_dir(path=None) -> str:
     if path:
         return os.path.abspath(path)
@@ -181,9 +282,15 @@ def load_program(kmb_path, *, cache: ProgramCache | None = None, executor=None):
     """
     from . import compile_kmb
     cache = cache or ProgramCache(enabled=False)
+    t0 = time.perf_counter()
+    mem = memory()
+    if mem is not None:
+        hit = mem.lookup(kmb_path)
+        if hit is not None:
+            sha, prog = hit
+            return prog, sha, dict(source='memory', hash_s=0.0, save_needed=False, wall_s=time.perf_counter() - t0)
     own = executor is None
     ex = executor or concurrent.futures.ThreadPoolExecutor(1)
-    t0 = time.perf_counter()
     info = {}
     try:
         guess = cache.hint(kmb_path) if cache.enabled else None
@@ -201,6 +308,8 @@ def load_program(kmb_path, *, cache: ProgramCache | None = None, executor=None):
         info['save_needed'] = cache.enabled and kind == 'compiled' and not os.path.exists(cache.program_path(sha))
         if cache.enabled:
             cache.write_hint(kmb_path, sha)
+        if mem is not None:
+            mem.remember(kmb_path, sha, prog)
         info['wall_s'] = time.perf_counter() - t0
         return prog, sha, info
     finally:
