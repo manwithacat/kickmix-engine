@@ -6,6 +6,9 @@
 //!   qrom-plan flips <words.npy> <plans_dir> <n> <seed> [threads] [max_mismatch_examples] [exclude_coded_status_flips 0|1]
 //!   qrom-plan bench <words.npy> <plans_dir> <n> <seed> [threads] [max_mismatch_examples] [exclude_coded_status_flips 0|1]
 //!   qrom-plan replan-flips <words.npy> <plans_dir> <n> <seed> [threads] [trials] [samples] [repair_s] [seeds_per_flip]
+//!   qrom-plan screen <words.npy> <plans_dir> <col_from> <col_to_excl> <bits e.g. 1,2,3,4,5,6> <out.tsv> [threads] [loaders e.g. 4,5,6]
+//!   qrom-plan stack <words.npy> <plans_dir> <cands.txt> <k> <sub_index> <target_gain> <out_flips.txt>
+//!   qrom-plan batch <words.npy> <plans_dir> <flips.txt> <out_dir> <counts e.g. 109,111,113> <seed_from> <seed_to> [threads] [trials] [samples] [repair_s] [loaders]
 //!
 //! Plans are text files k0.txt .. k14.txt (see textio.rs). All output is JSON on stdout.
 
@@ -13,7 +16,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
-use qrom_plan::flips::{apply, changes_coded_status, loaders_of, Flip, FlipReport, LoaderModel, Recipe};
+use qrom_plan::bits::B128;
+
+use qrom_plan::flips::{apply, changes_coded_status, loaders_of, sub_cols, Flip, FlipReport, LoaderModel, Recipe};
 use qrom_plan::loader::Words;
 use qrom_plan::plan::plan_once;
 use qrom_plan::problem::{default_groups, Problem};
@@ -33,6 +38,9 @@ fn main() {
         "flips" => cmd_flips(&args[2..], true),
         "bench" => cmd_flips(&args[2..], false),
         "replan-flips" => cmd_replan_flips(&args[2..]),
+        "screen" => cmd_screen(&args[2..]),
+        "batch" => cmd_batch(&args[2..]),
+        "stack" => cmd_stack(&args[2..]),
         other => Err(format!("unknown command {other}")),
     };
     match r {
@@ -497,4 +505,240 @@ fn run_threads<T: Send + 'static>(threads: usize, n: usize, f: impl Fn(usize) ->
         })
         .collect();
     handles.into_iter().flat_map(|h| h.join().unwrap()).collect()
+}
+
+fn parse_list(text: &str) -> Result<Vec<usize>, String> {
+    text.split(',').filter(|x| !x.trim().is_empty()).map(|x| x.trim().parse::<usize>().map_err(|e| format!("list: {e}"))).collect()
+}
+
+/// Screen every single flip of a column range on the loaders it touches; write hits (flips that raise a supply
+/// nullity) as TSV and a summary as JSON.
+fn cmd_screen(args: &[String]) -> Result<Json, String> {
+    use qrom_plan::search::screen;
+    let t0 = Instant::now();
+    let models = load_models(Path::new(&args[0]), Path::new(&args[1]))?;
+    let col_from: usize = args[2].parse().map_err(|e| format!("col_from: {e}"))?;
+    let col_to: usize = args[3].parse().map_err(|e| format!("col_to: {e}"))?;
+    let bits: Vec<u8> = parse_list(&args[4])?.into_iter().map(|b| b as u8).collect();
+    let out_path = PathBuf::from(&args[5]);
+    let threads: usize = arg(args, 6, 1).max(1);
+    let only: Option<Vec<usize>> = args.get(7).map(|s| parse_list(s)).transpose()?;
+    let t_load = t0.elapsed().as_secs_f64();
+    let words = Arc::new(models.words);
+    let coded = Arc::new(models.coded);
+    let lm = Arc::new(models.models);
+    let cols: Vec<usize> = (col_from..col_to).collect();
+    let t1 = Instant::now();
+    let (hits, stats) = screen(&words, &coded, &lm, cols, bits.clone(), threads, only);
+    let t_screen = t1.elapsed().as_secs_f64();
+    // TSV: addr col bit k broken patch shrank grew(sub indices ; slots)
+    let mut text = String::new();
+    for (k, m) in lm.iter().enumerate() {
+        text.push_str(&format!("# k{k} sub index -> slots: "));
+        for (i, s) in m.subs.iter().enumerate() {
+            text.push_str(&format!("{i}={} ", s.iter().map(|x| x.to_string()).collect::<Vec<_>>().join("+")));
+        }
+        text.push('\n');
+    }
+    text.push_str("# addr\tcol\tbit\tk\tbroken\tpatch\tshrank\tgrew\n");
+    let mut per_bit: std::collections::BTreeMap<u8, usize> = Default::default();
+    let mut per_k: std::collections::BTreeMap<usize, usize> = Default::default();
+    let mut per_k_triple: std::collections::BTreeMap<usize, usize> = Default::default();
+    let mut per_k_pair: std::collections::BTreeMap<usize, usize> = Default::default();
+    let mut per_k_single: std::collections::BTreeMap<usize, usize> = Default::default();
+    let mut multi = 0usize;
+    for h in &hits {
+        *per_bit.entry(h.flip.bit).or_default() += 1;
+        *per_k.entry(h.k).or_default() += 1;
+        let sizes: Vec<usize> = h.grew.iter().map(|&i| lm[h.k].subs[i].len()).collect();
+        if sizes.contains(&3) {
+            *per_k_triple.entry(h.k).or_default() += 1;
+        }
+        if sizes.contains(&2) {
+            *per_k_pair.entry(h.k).or_default() += 1;
+        }
+        if sizes.contains(&1) {
+            *per_k_single.entry(h.k).or_default() += 1;
+        }
+        if h.grew.len() > 1 {
+            multi += 1;
+        }
+        text.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            h.flip.addr,
+            h.flip.col,
+            h.flip.bit,
+            h.k,
+            h.broken as u8,
+            h.patch.map_or("-".to_string(), |p| (p as u8).to_string()),
+            h.shrank,
+            h.grew.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(",")
+        ));
+    }
+    std::fs::write(&out_path, text).map_err(|e| format!("{}: {e}", out_path.display()))?;
+    let map_json = |m: &std::collections::BTreeMap<usize, usize>| Json::Obj(m.iter().map(|(k, v)| (k.to_string(), Json::Int(*v as i64))).collect());
+    Ok(Json::obj()
+        .push("columns", Json::ints(vec![col_from, col_to]))
+        .push("bits", Json::ints(bits.iter().map(|&b| b as usize)))
+        .push("flips", Json::Int(stats.flips as i64))
+        .push("skipped_coded_status", Json::Int(stats.skipped_coded as i64))
+        .push("loader_evaluations", Json::Int(stats.loader_evals as i64))
+        .push("hits", Json::Int(stats.hits as i64))
+        .push("hits_raising_more_than_one_sub", Json::Int(multi as i64))
+        .push("hits_per_bit", Json::Obj(per_bit.iter().map(|(k, v)| (k.to_string(), Json::Int(*v as i64))).collect()))
+        .push("hits_per_loader", map_json(&per_k))
+        .push("hits_raising_a_triple_per_loader", map_json(&per_k_triple))
+        .push("hits_raising_a_pair_per_loader", map_json(&per_k_pair))
+        .push("hits_raising_a_single_per_loader", map_json(&per_k_single))
+        .push("out", Json::Str(out_path.display().to_string()))
+        .push("seconds_load", Json::Float(t_load))
+        .push("seconds_screen", Json::Float(t_screen))
+        .push("flips_per_second", Json::Float(stats.flips as f64 / t_screen))
+        .push("seconds_total", Json::Float(t0.elapsed().as_secs_f64())))
+}
+
+/// Apply a batch of flips, report the exact supply change on the touched loaders and re-plan them over a
+/// counts x seeds lottery. seed_from == seed_to skips the lottery (supply report only).
+fn cmd_batch(args: &[String]) -> Result<Json, String> {
+    use qrom_plan::search::{apply_all, read_flips, replan_json, replan_lottery, supply_json, supply_report, write_best};
+    let t0 = Instant::now();
+    let models = load_models(Path::new(&args[0]), Path::new(&args[1]))?;
+    let flips = read_flips(Path::new(&args[2]))?;
+    let out_dir = PathBuf::from(&args[3]);
+    let counts = parse_list(&args[4])?;
+    let seed_from: u64 = args[5].parse().map_err(|e| format!("seed_from: {e}"))?;
+    let seed_to: u64 = args[6].parse().map_err(|e| format!("seed_to: {e}"))?;
+    let threads: usize = arg(args, 7, 1).max(1);
+    let trials: usize = arg(args, 8, 12);
+    let samples: usize = arg(args, 9, 24);
+    let repair_s: f64 = arg(args, 10, 60.0);
+    let only: Option<Vec<usize>> = args.get(11).map(|s| parse_list(s)).transpose()?;
+    std::fs::create_dir_all(&out_dir).map_err(|e| format!("{}: {e}", out_dir.display()))?;
+    // coded-status guard: refuse flips that change a column's coded structure
+    for f in &flips {
+        if changes_coded_status(&models.words, &models.coded, f) {
+            return Err(format!("flip {} {} {} changes the coded status of column {}", f.addr, f.col, f.bit, f.col));
+        }
+    }
+    let w2 = apply_all(&models.words, &flips);
+    let data: Vec<i64> = w2.data.iter().map(|&v| v as i64).collect();
+    qrom_plan::npy::write_npy_i16(&out_dir.join("words.npy"), w2.rows, w2.cols, &data)?;
+    let coded2 = w2.coded_columns();
+    if coded2 != models.coded {
+        return Err("coded columns changed".into());
+    }
+    let mut touched: Vec<usize> = Vec::new();
+    for f in &flips {
+        for k in loaders_of(f.col, models.models.len()) {
+            if !touched.contains(&k) && only.as_ref().map_or(true, |o| o.contains(&k)) {
+                touched.push(k);
+            }
+        }
+    }
+    if flips.is_empty() {
+        touched = only.clone().unwrap_or_default(); // control: the lottery on the unflipped table
+    }
+    touched.sort();
+    let mut per_loader = Vec::new();
+    let mut total_delta: i64 = 0;
+    let mut all_best = true;
+    for &k in &touched {
+        let m = &models.models[k];
+        let p2 = Arc::new(Problem::from_words(&w2, k, &m.problem.groups)?);
+        let sr = supply_report(m, &p2);
+        let mut row = supply_json(m, &sr);
+        if seed_to > seed_from {
+            let use_counts: Vec<usize> = if m.recipe.per.is_some() && !m.recipe.design.is_empty() { vec![m.relations.len()] } else { counts.clone() };
+            let rr = replan_lottery(&p2, &m.recipe.design, m.recipe.per, &use_counts, seed_from, seed_to, threads, trials, samples, repair_s);
+            let written = write_best(&out_dir, &rr)?;
+            let delta = rr.best.map_or(i64::MAX / 4, |b| (89 + b.0) as i64 - m.toffolis as i64);
+            if rr.best.is_none() {
+                all_best = false;
+            }
+            total_delta += delta;
+            row = row.push("replan", replan_json(&rr, m.toffolis)).push("best_plan_file", written.map_or(Json::Null, Json::Str));
+        }
+        per_loader.push(row);
+    }
+    let summary = Json::obj()
+        .push("flips", Json::Int(flips.len() as i64))
+        .push("flips_list", Json::Arr(flips.iter().map(|f| Json::ints([f.addr, f.col, f.bit as usize])).collect()))
+        .push("touched_loaders", Json::ints(touched.clone()))
+        .push("counts", Json::ints(counts.clone()))
+        .push("seeds", Json::ints(vec![seed_from as usize, seed_to as usize]))
+        .push("threads", Json::Int(threads as i64))
+        .push("total_toffoli_delta_vs_plans", if seed_to > seed_from && all_best { Json::Int(total_delta) } else { Json::Null })
+        .push("per_loader", Json::Arr(per_loader))
+        .push("words_out", Json::Str(out_dir.join("words.npy").display().to_string()))
+        .push("seconds_total", Json::Float(t0.elapsed().as_secs_f64()));
+    std::fs::write(out_dir.join("batch.json"), summary.to_string_pretty()).map_err(|e| format!("batch.json: {e}"))?;
+    Ok(summary)
+}
+
+/// Greedy stacking: walk an ordered candidate list (addr col bit) and keep each flip that raises the nullity of
+/// sub-matrix `sub` of loader `k` beyond what the kept flips already reached (exact recomputation after each
+/// tentative flip). Writes the kept flips with their cumulative gain.
+fn cmd_stack(args: &[String]) -> Result<Json, String> {
+    use qrom_plan::search::read_flips;
+    let t0 = Instant::now();
+    let models = load_models(Path::new(&args[0]), Path::new(&args[1]))?;
+    let cands = read_flips(Path::new(&args[2]))?;
+    let k: usize = args[3].parse().map_err(|e| format!("k: {e}"))?;
+    let sub: usize = args[4].parse().map_err(|e| format!("sub: {e}"))?;
+    let target: usize = args[5].parse().map_err(|e| format!("target: {e}"))?;
+    let out_path = PathBuf::from(&args[6]);
+    let m = &models.models[k];
+    let cols = sub_cols(&m.subs[sub]);
+    let base = m.nullities()[sub];
+    let nullity = |p: &Problem| -> usize {
+        let restricted: Vec<B128> = p
+            .rows
+            .iter()
+            .map(|r| {
+                let mut v = B128::ZERO;
+                for (ci, &c) in cols.iter().enumerate() {
+                    if r.get(c) {
+                        v.set(ci);
+                    }
+                }
+                v
+            })
+            .collect();
+        cols.len() - qrom_plan::gf2::rank(&restricted)
+    };
+    let mut w = models.words.clone();
+    let mut kept: Vec<(Flip, usize)> = Vec::new();
+    let mut reached = base;
+    let mut tried = 0usize;
+    for f in &cands {
+        if reached >= base + target {
+            break;
+        }
+        if changes_coded_status(&models.words, &models.coded, f) {
+            continue;
+        }
+        tried += 1;
+        w.flip(f.addr, f.col, f.bit);
+        let p = Problem::from_words(&w, k, &m.problem.groups)?;
+        let n = nullity(&p);
+        if n > reached {
+            reached = n;
+            kept.push((*f, n - base));
+        } else {
+            w.flip(f.addr, f.col, f.bit); // undo
+        }
+    }
+    let text: String = kept.iter().map(|(f, g)| format!("{} {} {} {}\n", f.addr, f.col, f.bit, g)).collect();
+    std::fs::write(&out_path, text).map_err(|e| format!("{}: {e}", out_path.display()))?;
+    Ok(Json::obj()
+        .push("k", Json::Int(k as i64))
+        .push("sub", Json::Int(sub as i64))
+        .push("slots", Json::ints(m.subs[sub].clone()))
+        .push("base_nullity", Json::Int(base as i64))
+        .push("reached_gain", Json::Int((reached - base) as i64))
+        .push("kept", Json::Int(kept.len() as i64))
+        .push("tried", Json::Int(tried as i64))
+        .push("candidates", Json::Int(cands.len() as i64))
+        .push("out", Json::Str(out_path.display().to_string()))
+        .push("seconds", Json::Float(t0.elapsed().as_secs_f64())))
 }

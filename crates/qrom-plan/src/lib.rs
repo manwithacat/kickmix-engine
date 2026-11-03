@@ -14,6 +14,7 @@ pub mod npy;
 pub mod plan;
 pub mod problem;
 pub mod rng;
+pub mod search;
 pub mod textio;
 
 use std::path::Path;

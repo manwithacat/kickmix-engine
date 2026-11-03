@@ -92,3 +92,25 @@ fn field<'a>(header: &'a str, key: &str) -> Option<&'a str> {
     let j2 = rest.find('}').unwrap_or(rest.len());
     Some(&rest[..j.min(j2)])
 }
+
+/// Write a 2-D array as little-endian int16 `.npy` (version 1.0, C order).
+pub fn write_npy_i16(path: &Path, rows: usize, cols: usize, data: &[i64]) -> Result<(), String> {
+    if data.len() != rows * cols {
+        return Err("shape mismatch".into());
+    }
+    let mut header = format!("{{'descr': '<i2', 'fortran_order': False, 'shape': ({rows}, {cols}), }}");
+    let pad = 64 - (10 + header.len() + 1) % 64;
+    header.push_str(&" ".repeat(pad % 64));
+    header.push('\n');
+    let mut bytes = Vec::with_capacity(10 + header.len() + 2 * data.len());
+    bytes.extend_from_slice(b"\x93NUMPY\x01\x00");
+    bytes.extend_from_slice(&(header.len() as u16).to_le_bytes());
+    bytes.extend_from_slice(header.as_bytes());
+    for &v in data {
+        if !(i16::MIN as i64..=i16::MAX as i64).contains(&v) {
+            return Err(format!("value {v} does not fit int16"));
+        }
+        bytes.extend_from_slice(&(v as i16).to_le_bytes());
+    }
+    std::fs::write(path, bytes).map_err(|e| format!("{}: {e}", path.display()))
+}
