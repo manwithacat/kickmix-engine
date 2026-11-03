@@ -33,6 +33,12 @@ KINDS = list(kind_names())
 TOFFOLI_KINDS = ("CCX", "CCZ", "CSWAP")
 
 
+def lockstep_default() -> bool:
+    """Lockstep pairs are on unless KICKMIX_ENGINE_LOCKSTEP is 0/false/off (a per-process switch for comparisons)."""
+    import os
+    return os.environ.get("KICKMIX_ENGINE_LOCKSTEP", "1").strip().lower() not in ("0", "false", "off", "no")
+
+
 def seed_words(seed: int) -> np.ndarray:
     """A 256-bit simulator seed (python int) as 8 little-endian uint32 words."""
     return np.array([(seed >> (32 * i)) & 0xFFFFFFFF for i in range(8)], dtype=np.uint32)
@@ -56,20 +62,36 @@ def compile_circuit(circuit) -> Program:
     return compile_text(str(circuit), circuit.num_qubits)
 
 
-def run(prog: Program, seeds, xs, xreg, *, s: int = 1, threads: int = 1, counting: bool = True, dump: bool = False):
+def run(prog: Program, seeds, xs, xreg, *, s: int = 1, threads: int = 1, counting: bool = True, dump: bool = False,
+        check=None, lockstep: bool | None = None):
     """Run chunks. seeds: uint32 [n_chunks, 8] (or python ints); xs: uint64 [n_chunks, B, 256*s].
 
     Returns dict of arrays shaped like xs: x_out (register read back), scratch_dirty (any scratch qubit nonzero),
     phase_units (verifier's 2^-64-turn integers); kind_counts [n_chunks, len(KINDS)] (see KINDS) and z_levels [n_chunks, 129]
     (Z_POW counts by Clifford-hierarchy level); toffoli_count [n_chunks] (CCX+CCZ+CSWAP, summed over shots).
     GIL is released during simulation. With dump=True also dump_* arrays (bit-sliced final state per 256-shot batch).
+
+    ``check=(target, tol)`` (uint64 tables indexed by x - 1, the invsqrt verifier's ``reference_values``) runs the
+    verifier's per-shot check on the engine instead of returning the per-shot arrays: ``check_min_margin`` [n_chunks]
+    (min tol - |error|), ``check_worst_ratio`` and ``check_worst_x`` [n_chunks] (largest |error| / tol, smallest x
+    on ties) and ``check_fail`` int64 [n_chunks, 6]: batch (-1 if the chunk passed), priority (0 x not restored,
+    1 scratch dirty, 2 phase out of tolerance), shot, x, error, allowed, for the first failing batch of the chunk.
+    ``lockstep=False`` runs every 256-shot sim alone instead of in pairs (identical results; for tests and timing).
     """
     seeds = np.asarray([seed_words(x) if isinstance(x, int) else x for x in seeds], dtype=np.uint32).reshape(-1, 8)
     xs = np.ascontiguousarray(xs, dtype=np.uint64)
     n_chunks, b, per = xs.shape
     assert per == 256 * s and n_chunks == len(seeds)
-    r = _run(prog, seeds, xs.reshape(-1), [int(q) for q in xreg], s, b, threads, counting, dump)
+    if check is not None:
+        check = (np.ascontiguousarray(check[0], dtype=np.uint64), np.ascontiguousarray(check[1], dtype=np.uint64))
+    r = _run(prog, seeds, xs.reshape(-1), [int(q) for q in xreg], s, b, threads, counting, dump, check,
+             lockstep_default() if lockstep is None else lockstep)
     out = {k: v.reshape(n_chunks, b, per) for k, v in r.items() if k in ("x_out", "scratch_dirty", "phase_units")}
+    if check is not None:
+        out["check_min_margin"] = r["check_min_margin"]
+        out["check_worst_ratio"] = r["check_worst_ratio"]
+        out["check_worst_x"] = r["check_worst_x"]
+        out["check_fail"] = r["check_fail"].reshape(n_chunks, 6)
     kc = r["kind_counts"].reshape(n_chunks, len(KINDS))
     out["kind_counts"] = kc
     out["z_levels"] = r["z_levels"].reshape(n_chunks, 129)
@@ -90,7 +112,7 @@ def compile_kmb(path) -> Program:
 
 
 def run_batches(prog: Program, seeds, qin_ids, qin, bin_ids, bin_, *, threads: int = 1, counting: bool = True,
-                dump: bool = False):
+                dump: bool = False, lockstep: bool | None = None):
     """Independent 256-shot batches, each one kickmix ``Simulator(batch_size=256, seed=seeds[i])``.
 
     qin: uint64 [n, len(qin_ids), 4] bit-sliced input qubit values (bit s of word s//64 = shot s);
@@ -99,13 +121,15 @@ def run_batches(prog: Program, seeds, qin_ids, qin, bin_ids, bin_, *, threads: i
     phase_units [n, 256] (each shot's final phase in 2^-64 turns, uint64, flip included: the invsqrt verifier's
     rounding), kind_counts [n, len(KINDS)], z_levels [n, 129], toffoli_count [n]; with dump=True also dump_q
     [n, nq, 4] and dump_bits [n, num_bits, 4]. The GIL is released during simulation; concurrent calls share one
-    thread pool.
+    thread pool. Batches are simulated in lockstep pairs (one op decode, two independent sims); ``lockstep=False``
+    runs them singly with identical results.
     """
     seeds = np.asarray([seed_words(x) if isinstance(x, int) else x for x in seeds], dtype=np.uint32).reshape(-1, 8)
     n = len(seeds)
     qin = np.ascontiguousarray(qin, dtype=np.uint64).reshape(-1)
     bin_ = np.ascontiguousarray(bin_, dtype=np.uint64).reshape(-1)
-    r = _run_batches(prog, seeds, [int(q) for q in qin_ids], qin, [int(b) for b in bin_ids], bin_, threads, counting, dump)
+    r = _run_batches(prog, seeds, [int(q) for q in qin_ids], qin, [int(b) for b in bin_ids], bin_, threads, counting, dump,
+                     lockstep_default() if lockstep is None else lockstep)
     out = dict(val_err=r["val_err"].reshape(n, 4), phase=r["phase"].reshape(n, 4),
                phase_units=r["phase_units"].reshape(n, 256))
     out["kind_counts"] = kc = r["kind_counts"].reshape(n, len(KINDS))
@@ -117,7 +141,8 @@ def run_batches(prog: Program, seeds, qin_ids, qin, bin_ids, bin_, *, threads: i
     return out
 
 
-def run_sequence(progs, seed, x0, xreg, *, threads: int = 1, counting: bool = True, dump: bool = False):
+def run_sequence(progs, seed, x0, xreg, *, threads: int = 1, counting: bool = True, dump: bool = False,
+                 lockstep: bool | None = None):
     """Apply programs in turn to one kickmix ``Simulator(batch_size=shots, seed=seed)``, as the dfthcsos verifier does.
 
     Step 0 starts from zero with the ``xreg`` qubits set from ``x0``; before each later step the simulator is
@@ -139,7 +164,8 @@ def run_sequence(progs, seed, x0, xreg, *, threads: int = 1, counting: bool = Tr
     if xw != max(1, -(-len(xreg) // 64)):
         raise ValueError(f"x0 must have ceil(len(xreg) / 64) = {max(1, -(-len(xreg) // 64))} words per shot")
     progs = list(progs)
-    r = _run_sequence(progs, [int(x) for x in seed], x0.reshape(-1), [int(q) for q in xreg], shots, threads, counting, dump)
+    r = _run_sequence(progs, [int(x) for x in seed], x0.reshape(-1), [int(q) for q in xreg], shots, threads, counting, dump,
+                      lockstep_default() if lockstep is None else lockstep)
     ns = len(progs)
     out = dict(x_out=r["x_out"].reshape(ns, shots, xw), dirty=r["dirty"].reshape(ns, shots).view(bool),
                phase=r["phase"].reshape(ns, shots).view(bool))

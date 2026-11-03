@@ -441,6 +441,17 @@ PLUGINS = {"generic": TaskPlugin, "dqi": DQIPlugin, "invsqrt": InvSqrtPlugin, "d
 
 
 def make_plugin(name: str, verifier_path=None, **spec) -> TaskPlugin:
+    """A task plug-in; in a resident engine (``kickmix-engine serve``) the same (task, verifier, spec) returns the
+    same instance, so reference tables such as invsqrt's `reference_values` are computed once per process."""
     if name not in PLUGINS:
         raise ValueError(f"unknown task plug-in {name!r}; have {sorted(PLUGINS)}")
-    return PLUGINS[name](verifier_path=verifier_path, **spec)
+    from .cache import memory
+    mem = memory()
+    if mem is None:
+        return PLUGINS[name](verifier_path=verifier_path, **spec)
+    key = (name, verifier_path, repr(sorted(spec.items())))
+    if key in mem.plugins:
+        mem.stats["plugin_hits"] += 1
+    else:
+        mem.plugins[key] = PLUGINS[name](verifier_path=verifier_path, **spec)
+    return mem.plugins[key]

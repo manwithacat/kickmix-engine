@@ -7,6 +7,12 @@
     kickmix-engine profile TASK BASE.kmb --out DIR [--draws N] [--anchor HASH] [--salt-format sweep-{}] ...
     kickmix-engine cache info|prune|clear [--cache-dir DIR]
     kickmix-engine doctor [--json] [--manifest PATH_OR_URL]
+    kickmix-engine serve --socket PATH [--max-programs N]
+    kickmix-engine --via PATH <any command above> | ping | stats | stop
+
+`serve` keeps one engine process resident (compiled programs, plug-in reference tables and profiles stay in memory)
+and `--via PATH` sends a command to it: the output and exit code are those of the one-shot command (see
+python/kickmix_engine/resident.py).
 
 `diff` compares two circuits of any task (`generic` for a circuit without a verifier) in three layers: structural
 (op-level alignment, hunks, static deltas, register interface), semantic (both circuits on identical inputs and
@@ -258,6 +264,13 @@ def cmd_cache(a):
 
 
 def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] == '--via':
+        if len(argv) < 2:
+            print('--via needs the socket path of a running `kickmix-engine serve`', file=sys.stderr)
+            return 2
+        from .resident import via
+        return via(argv[1], argv[2:])
     ap = argparse.ArgumentParser(prog='kickmix-engine', description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest='cmd', required=True)
@@ -329,7 +342,13 @@ def main(argv=None):
     d = sub.add_parser('doctor', help='report CPU features, kernels, versions, cache and verifier status')
     d.add_argument('--json', action='store_true', help='one JSON object (for agents and automation)')
     d.add_argument('--manifest', default=None, help='release-manifest.json (path or URL): name the matching wheel')
+    s = sub.add_parser('serve', help='keep this engine process resident and serve commands sent with --via')
+    s.add_argument('--socket', required=True, help='Unix socket path to listen on (created mode 0600)')
+    s.add_argument('--max-programs', type=int, default=8, help='compiled programs kept in memory (LRU; default 8)')
     a = ap.parse_args(argv)
+    if a.cmd == 'serve':
+        from .resident import serve
+        return serve(a.socket, max_programs=a.max_programs)
     if a.cmd == 'doctor':
         from .doctor import main as doctor_main
         return doctor_main(a)

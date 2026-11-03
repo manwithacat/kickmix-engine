@@ -57,6 +57,20 @@ impl PyProgram {
     fn max_stack_depth(&self) -> usize { self.inner.max_stack_depth }
     #[getter]
     fn num_cx_runs(&self) -> usize { self.inner.n_cx_runs }
+    /// Uniform runs (branch-free stretches of plain NEG/Z/X/CZ/CX/CCZ/CCX) in the stream.
+    #[getter]
+    fn num_uni_runs(&self) -> usize { self.inner.n_uni_runs }
+    /// Composition of the compiled stream: dict(cx_runs, cx_entries, uni_runs, uni_groups, uni_entries,
+    /// uni_if_entries, interp_ops, words).
+    fn stream_stats<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let s = self.inner.stream_stats();
+        let d = PyDict::new(py);
+        for (k, v) in [("cx_runs", s[0]), ("cx_entries", s[1]), ("uni_runs", s[2]), ("uni_groups", s[3]), ("uni_entries", s[4]),
+                       ("uni_if_entries", s[5]), ("interp_ops", s[6]), ("words", self.inner.code.len() as u64)] {
+            d.set_item(k, v)?;
+        }
+        Ok(d)
+    }
     /// kickmix `Circuit.reaction_depth()`, computed once at compile time and stored in the program cache.
     #[getter]
     fn reaction_depth(&self) -> u64 { self.inner.reaction_depth }
@@ -100,8 +114,11 @@ fn derive_keys<'py>(py: Python<'py>, seed: [u32; 8], nsims: usize) -> Bound<'py,
     PyArray1::from_vec(py, flat)
 }
 
+/// `check=(target, tol)` (uint64 tables indexed by x - 1) runs the invsqrt per-shot check on the engine and returns
+/// per-chunk `check_min_margin`, `check_worst_ratio`, `check_worst_x` and `check_fail` [n_chunks * 6] instead of
+/// the per-shot arrays (see `engine::CheckOut`).
 #[pyfunction]
-#[pyo3(signature = (prog, seeds, xs, xreg, s, b, threads=1, counting=true, dump=false))]
+#[pyo3(signature = (prog, seeds, xs, xreg, s, b, threads=1, counting=true, dump=false, check=None, lockstep=true))]
 #[allow(clippy::too_many_arguments)]
 fn run<'py>(
     py: Python<'py>,
@@ -114,6 +131,8 @@ fn run<'py>(
     threads: usize,
     counting: bool,
     dump: bool,
+    check: Option<(PyReadonlyArray1<'py, u64>, PyReadonlyArray1<'py, u64>)>,
+    lockstep: bool,
 ) -> PyResult<Bound<'py, PyDict>> {
     let sd = seeds.as_array();
     if sd.ncols() != 8 {
@@ -121,17 +140,32 @@ fn run<'py>(
     }
     let seeds_v: Vec<[u32; 8]> = sd.rows().into_iter().map(|r| { let mut a = [0u32; 8]; for i in 0..8 { a[i] = r[i]; } a }).collect();
     let xs_s = xs.as_slice()?;
+    if check.is_some() && dump {
+        return Err(PyValueError::new_err("check and dump cannot be combined"));
+    }
+    let ck_tabs = match &check {
+        Some((t, l)) => Some((t.as_slice()?, l.as_slice()?)),
+        None => None,
+    };
+    let ck = ck_tabs.map(|(target, tol)| engine::Check { target, tol });
     let p = prog.inner.clone();
     let out = py
         .detach(|| {
-            let spec = engine::RunSpec { prog: &p, seeds: &seeds_v, s, b, xs: xs_s, xreg: &xreg, counting, dump, threads };
+            let spec = engine::RunSpec { prog: &p, seeds: &seeds_v, s, b, xs: xs_s, xreg: &xreg, counting, dump, threads, check: ck.as_ref(), lockstep };
             engine::run(&spec)
         })
         .map_err(PyValueError::new_err)?;
     let d = PyDict::new(py);
-    d.set_item("x_out", PyArray1::from_vec(py, out.x_out))?;
-    d.set_item("scratch_dirty", PyArray1::from_vec(py, out.dirty))?;
-    d.set_item("phase_units", PyArray1::from_vec(py, out.units))?;
+    if let Some(c) = out.check {
+        d.set_item("check_min_margin", PyArray1::from_vec(py, c.min_margin))?;
+        d.set_item("check_worst_ratio", PyArray1::from_vec(py, c.worst_ratio))?;
+        d.set_item("check_worst_x", PyArray1::from_vec(py, c.worst_x))?;
+        d.set_item("check_fail", PyArray1::from_vec(py, c.fail))?;
+    } else {
+        d.set_item("x_out", PyArray1::from_vec(py, out.x_out))?;
+        d.set_item("scratch_dirty", PyArray1::from_vec(py, out.dirty))?;
+        d.set_item("phase_units", PyArray1::from_vec(py, out.units))?;
+    }
     d.set_item("kind_counts", PyArray1::from_vec(py, out.kind_counts))?;
     d.set_item("z_levels", PyArray1::from_vec(py, out.z_levels))?;
     if dump {
@@ -146,7 +180,7 @@ fn run<'py>(
 /// Independent 256-shot batches (one kickmix Simulator(batch_size=256, seed) each). Inputs bit-sliced:
 /// qin [n_batches * len(qin_ids) * 4] u64, bin [n_batches * len(bin_ids) * 4] u64 (compact bit ids).
 #[pyfunction]
-#[pyo3(signature = (prog, seeds, qin_ids, qin, bin_ids, bin, threads=1, counting=true, dump=false))]
+#[pyo3(signature = (prog, seeds, qin_ids, qin, bin_ids, bin, threads=1, counting=true, dump=false, lockstep=true))]
 #[allow(clippy::too_many_arguments)]
 fn run_batches<'py>(
     py: Python<'py>,
@@ -159,6 +193,7 @@ fn run_batches<'py>(
     threads: usize,
     counting: bool,
     dump: bool,
+    lockstep: bool,
 ) -> PyResult<Bound<'py, PyDict>> {
     let sd = seeds.as_array();
     if sd.ncols() != 8 {
@@ -169,7 +204,7 @@ fn run_batches<'py>(
     let p = prog.inner.clone();
     let out = py
         .detach(|| {
-            let spec = engine::BatchSpec { prog: &p, seeds: &seeds_v, qin_ids: &qin_ids, qin: qs, bin_ids: &bin_ids, bin: bs, counting, dump, threads };
+            let spec = engine::BatchSpec { prog: &p, seeds: &seeds_v, qin_ids: &qin_ids, qin: qs, bin_ids: &bin_ids, bin: bs, counting, dump, threads, lockstep };
             engine::run_batches(&spec)
         })
         .map_err(PyValueError::new_err)?;
@@ -282,12 +317,12 @@ fn sample_dqi<'py>(
 /// DQI batches sampled and simulated on the engine (one Rayon task per batch). Returns val_err, phase (simulated),
 /// expected (sampled) [n * 4] u64 words, kind_counts [n * NCOUNT], z_levels [n * 129].
 #[pyfunction]
-#[pyo3(signature = (prog, m, n, degree, cdf, log, antilog, e_rows, pcg, seeds, qin_ids, bin_ids, threads=1, counting=true))]
+#[pyo3(signature = (prog, m, n, degree, cdf, log, antilog, e_rows, pcg, seeds, qin_ids, bin_ids, threads=1, counting=true, lockstep=true))]
 #[allow(clippy::too_many_arguments)]
 fn run_dqi<'py>(
     py: Python<'py>, prog: &PyProgram, m: usize, n: usize, degree: usize, cdf: Vec<f64>, log: Vec<u32>, antilog: Vec<u32>,
     e_rows: Vec<u32>, pcg: PyReadonlyArray2<u64>, seeds: PyReadonlyArray2<u32>, qin_ids: Vec<u32>, bin_ids: Vec<u32>,
-    threads: usize, counting: bool,
+    threads: usize, counting: bool, lockstep: bool,
 ) -> PyResult<Bound<'py, PyDict>> {
     let s = make_sampler(m, n, degree, cdf, log, antilog, e_rows)?;
     let st = parse_pcg(&pcg.as_array())?;
@@ -299,7 +334,7 @@ fn run_dqi<'py>(
     let p = prog.inner.clone();
     let out = py
         .detach(|| {
-            let spec = engine::DqiSpec { prog: &p, sampler: &s, pcg: &st, seeds: &seeds_v, qin_ids: &qin_ids, bin_ids: &bin_ids, counting, threads };
+            let spec = engine::DqiSpec { prog: &p, sampler: &s, pcg: &st, seeds: &seeds_v, qin_ids: &qin_ids, bin_ids: &bin_ids, counting, threads, lockstep };
             engine::run_dqi(&spec)
         })
         .map_err(PyValueError::new_err)?;
@@ -318,7 +353,7 @@ fn run_dqi<'py>(
 /// dirty and phase (uint8 [steps * shots]), kind_counts [steps * NCOUNT], z_levels [steps * 129]; with dump=True
 /// also dump_q [steps * sims * dump_nq * 4] and dump_bits [steps * sims * dump_nb * 4] (bit-sliced, 256 shots/sim).
 #[pyfunction]
-#[pyo3(signature = (progs, seed, x0, xreg, shots, threads=1, counting=true, dump=false))]
+#[pyo3(signature = (progs, seed, x0, xreg, shots, threads=1, counting=true, dump=false, lockstep=true))]
 #[allow(clippy::too_many_arguments)]
 fn run_sequence<'py>(
     py: Python<'py>,
@@ -330,13 +365,14 @@ fn run_sequence<'py>(
     threads: usize,
     counting: bool,
     dump: bool,
+    lockstep: bool,
 ) -> PyResult<Bound<'py, PyDict>> {
     let arcs: Vec<Arc<program::Program>> = progs.iter().map(|p| p.inner.clone()).collect();
     let x0s = x0.as_slice()?;
     let out = py
         .detach(|| {
             let refs: Vec<&program::Program> = arcs.iter().map(|a| a.as_ref()).collect();
-            let spec = engine::SeqSpec { progs: &refs, seed: &seed, shots, xreg: &xreg, x0: x0s, counting, dump, threads };
+            let spec = engine::SeqSpec { progs: &refs, seed: &seed, shots, xreg: &xreg, x0: x0s, counting, dump, threads, lockstep };
             engine::run_sequence(&spec)
         })
         .map_err(PyValueError::new_err)?;

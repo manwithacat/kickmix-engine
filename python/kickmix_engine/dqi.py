@@ -30,7 +30,7 @@ import time
 
 import numpy as np
 
-from . import KINDS, _engine, compile_kmb, run_batches, seed_words, words_to_bools
+from . import KINDS, _engine, compile_kmb, lockstep_default, run_batches, seed_words, words_to_bools
 from .cache import ProgramCache, file_sha256, load_program
 
 M64 = (1 << 64) - 1
@@ -283,7 +283,7 @@ class DQITask:
             tr = time.perf_counter()
             r = _engine.run_dqi(self.prog, a['m'], a['n'], a['degree'], a['cdf'], a['log'], a['antilog'],
                                 [int(x) for x in self.e_keep], pcg, sims, qin_ids, [int(x) for x in self.e_compact],
-                                threads, True)
+                                threads, True, lockstep_default())
             self.t_run = time.perf_counter() - tr
             k = len(tasks)
             val = words_to_bools(r['val_err'].reshape(k, 4))

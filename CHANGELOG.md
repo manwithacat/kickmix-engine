@@ -5,11 +5,49 @@ owner's direction; see NOTICE.
 
 ## 0.6.0 (2026-11-03)
 
-Circuit comparison becomes a core operation (`diff`, `profile`, a general paired runner and task plug-ins), and the
-workspace gains the `qrom-plan` crate. The simulator is unchanged from 0.5.0 apart from the new `phase_units`
-output, and `verify` results are identical.
+Circuit comparison becomes a core operation (`diff`, `profile`, a general paired runner and task plug-ins), the
+workspace gains the `qrom-plan` crate, and the simulator gets uniform runs and lockstep pairs (invsqrt about 2x,
+DQI about 1.25x faster than 0.5.0) plus a resident engine. `verify` results are identical to 0.5.0.
 
-### Added
+### Changed (simulator speed; cache format 4)
+- **Uniform runs.** The compiler gathers NEG, Z, X, CZ, CX, CCZ and CCX ops, with or without a bit condition, into
+  runs of three-word entries that the simulator executes without a data-dependent branch:
+  `t = base & bits[cb] & q[a] & q[b] & q[c]; q[d] ^= t`. The qubit array now starts with a constant all-ones slot
+  (absent operands) and eight rotating write-only sinks (phase ops XOR into a sink and, through a mask derived from
+  the sink index, into the register-resident phase); the bit array starts with a constant all-ones bit. Counts come
+  from one popcount per condition group times the run's static histogram, which equals the ordinary path's per-op
+  popcounts. Runs without conditions (`K_UNIRUN`) use two-word entries, runs with conditions (`K_UNIRUN_IF`)
+  three-word entries; the counts are (condition, kind, count) items. Plain CX stretches of two or more remain CX
+  runs (one word per entry). Qubit ids must now be below 65,527. Cache format 4.
+- **Lockstep pairs.** `run` (the invsqrt chunk model), `run_batches` and `run_dqi` (DQI, the paired runner) and
+  `run_sequence` (chemistry) simulate two independent 256-shot sims per op (`SimG<8>`, one decode, two states, own
+  RNG streams and counts), which lets the core overlap the read-modify-write chains of arithmetic-heavy circuits
+  and halves the instruction-stream reads per sim of the 64M-op DQI circuits. `lockstep=False` on each keeps the
+  single-sim path; results are identical. `Program.stream_stats()` reports the stream composition.
+- Measured per 256-shot batch at 1 thread with counting (Apple M2 Pro, loaded machine): invsqrt `bce2948ff24e`
+  242 us -> 98 us; DQI `e3928244a1c1` (64.2M ops) 101 ms -> 77 ms with the program at 310 MiB against 303 MiB
+  (an intermediate uniform-run layout with 8-word count groups had been 109 ms and 357 MiB). Synthetic: a random
+  CX/CZ/CCX/X/Z mix 6.5 -> 1.6 ns per op per 256 shots. The NumPy per-x check that the card named as the
+  bottleneck measured about 1% of invsqrt wall time.
+
+### Added (resident engine and on-engine invsqrt check)
+- `run(..., check=(target, tol))` (Rust `engine::Check`): the invsqrt verifier's per-shot check on the engine
+  (x restored, scratch clean, |theta - target(x)| <= tol(x) in 2^-64-turn units with the verifier's wrapping
+  arithmetic, its failure order within a batch, min margin and worst-ratio folds), returned per chunk; the adapter
+  no longer moves 200M per-shot words into NumPy. `Program.num_uni_runs`.
+- **Resident engine.** `kickmix-engine serve --socket PATH [--max-programs N]` keeps one process alive;
+  `kickmix-engine --via PATH <command>` runs any command there (`ping`, `stats`, `stop` are control requests). The
+  server runs the ordinary CLI with captured output, so a served command prints what the one-shot CLI prints and
+  exits with its code. It keeps compiled programs by content hash (unchanged files, by realpath, size, mtime_ns and
+  inode, are not re-read), task plug-ins with their reference tables and parsed profile JSONs (`cache.Memory`).
+  Python: `kickmix_engine.resident.Client(socket).call(argv) / .json(argv)`.
+- Tests: `tests/test_invsqrt_check.py` (engine check against the NumPy restatement: pass folds, zero tolerance,
+  phase/x/dirty failures and their priority, first failing chunk and batch, bad inputs; uniform runs with
+  bit-conditioned gates), `tests/test_resident.py` (served output equals one-shot, memory hits, error relay,
+  `--via`). The existing suite is unchanged and passes.
+
+### Added (comparison and tooling)
+
 - **`crates/qrom-plan`** (workspace member, Rust, no third-party crates; source only, not in the Python wheel:
   `cargo build --release -p qrom-plan`): a bit-packed GF(2) cost model for the VQCC chemistry `ANGLE_k` five-word
   QROM loaders. It ports the Python kernel-relation planner (loader build, relation draws, pairing, repair, terms

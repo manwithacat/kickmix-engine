@@ -1,29 +1,76 @@
-//! Bit-sliced simulator of one 256-shot kickmix `Sim`. Semantics follow kickmix (Apache-2.0, Google LLC); see NOTICE.
+//! Bit-sliced simulator of one or more 256-shot kickmix `Sim`s run in lockstep. Semantics follow kickmix
+//! (Apache-2.0, Google LLC); see NOTICE.
+//!
+//! `Wn<L>` holds `L` 64-bit words = `L / 4` independent 256-shot sims (`W = Wn<4>` is one sim, `W2 = Wn<8>` two).
+//! Lockstep means one decode of every op applied to both states; the sims are independent (own RNG stream, own
+//! counts, own inputs), so the shot-level results equal two single runs. Running two sims per op lets the core
+//! overlap the two independent read-modify-write chains that dominate arithmetic-heavy circuits.
 
 use crate::program::*;
 use crate::rng::{ChaCha8, Keys};
 use std::ops::{BitAnd, BitAndAssign, BitOr, BitXor, BitXorAssign, Not};
 
-/// 256 shots; bit s of the word = shot s (word s/64, bit s%64). Matches kickmix's TWord lane order.
+/// `L` words of 64 shots; bit s of word s/64 = shot s. Words 4k..4k+4 are sim k (kickmix's TWord lane order).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(C, align(16))]
-pub struct W(pub [u64; 4]);
+pub struct Wn<const L: usize>(pub [u64; L]);
 
-impl W {
-    pub const ZERO: W = W([0; 4]);
-    pub const ONES: W = W([!0; 4]);
+/// One 256-shot sim.
+pub type W = Wn<4>;
+/// Two 256-shot sims in lockstep.
+pub type W2 = Wn<8>;
+
+impl<const L: usize> Wn<L> {
+    pub const ZERO: Wn<L> = Wn([0; L]);
+    pub const ONES: Wn<L> = Wn([!0; L]);
+    /// Sims held (256 shots each).
+    pub const SIMS: usize = L / 4;
+    #[inline(always)]
+    pub const fn splat(x: u64) -> Wn<L> {
+        Wn([x; L])
+    }
+    /// Set shots over all sims.
     #[inline(always)]
     pub fn popcnt(self) -> u64 {
-        (self.0[0].count_ones() + self.0[1].count_ones() + self.0[2].count_ones() + self.0[3].count_ones()) as u64
+        let mut n = 0u64;
+        for i in 0..L {
+            n += self.0[i].count_ones() as u64;
+        }
+        n
+    }
+    /// Set shots of sim `s`.
+    #[inline(always)]
+    pub fn popcnt_sim(self, s: usize) -> u64 {
+        let b = 4 * s;
+        (self.0[b].count_ones() + self.0[b + 1].count_ones() + self.0[b + 2].count_ones() + self.0[b + 3].count_ones()) as u64
+    }
+    /// The 256 bits of sim `s`.
+    #[inline(always)]
+    pub fn sim(self, s: usize) -> W {
+        Wn([self.0[4 * s], self.0[4 * s + 1], self.0[4 * s + 2], self.0[4 * s + 3]])
+    }
+    /// One random word per sim from that sim's stream.
+    #[inline(always)]
+    fn from_rngs(rngs: &mut [ChaCha8]) -> Wn<L> {
+        let mut out = [0u64; L];
+        for s in 0..L / 4 {
+            let r = rngs[s].next();
+            out[4 * s..4 * s + 4].copy_from_slice(&r);
+        }
+        Wn(out)
     }
 }
 macro_rules! binop {
     ($tr:ident, $f:ident, $op:tt) => {
-        impl $tr for W {
-            type Output = W;
+        impl<const L: usize> $tr for Wn<L> {
+            type Output = Wn<L>;
             #[inline(always)]
-            fn $f(self, o: W) -> W {
-                W([self.0[0] $op o.0[0], self.0[1] $op o.0[1], self.0[2] $op o.0[2], self.0[3] $op o.0[3]])
+            fn $f(self, o: Wn<L>) -> Wn<L> {
+                let mut r = [0u64; L];
+                for i in 0..L {
+                    r[i] = self.0[i] $op o.0[i];
+                }
+                Wn(r)
             }
         }
     };
@@ -31,22 +78,26 @@ macro_rules! binop {
 binop!(BitAnd, bitand, &);
 binop!(BitOr, bitor, |);
 binop!(BitXor, bitxor, ^);
-impl Not for W {
-    type Output = W;
+impl<const L: usize> Not for Wn<L> {
+    type Output = Wn<L>;
     #[inline(always)]
-    fn not(self) -> W {
-        W([!self.0[0], !self.0[1], !self.0[2], !self.0[3]])
+    fn not(self) -> Wn<L> {
+        let mut r = [0u64; L];
+        for i in 0..L {
+            r[i] = !self.0[i];
+        }
+        Wn(r)
     }
 }
-impl BitAndAssign for W {
+impl<const L: usize> BitAndAssign for Wn<L> {
     #[inline(always)]
-    fn bitand_assign(&mut self, o: W) {
+    fn bitand_assign(&mut self, o: Wn<L>) {
         *self = *self & o;
     }
 }
-impl BitXorAssign for W {
+impl<const L: usize> BitXorAssign for Wn<L> {
     #[inline(always)]
-    fn bitxor_assign(&mut self, o: W) {
+    fn bitxor_assign(&mut self, o: Wn<L>) {
         *self = *self ^ o;
     }
 }
@@ -85,15 +136,21 @@ impl Counts {
     }
 }
 
-pub struct Sim {
-    pub q: Vec<W>,
-    pub bits: Vec<W>,
-    pub phase: W,
+/// `L / 4` sims in lockstep (see the module doc). `Sim = SimG<4>` is the single-sim form every caller used before.
+pub struct SimG<const L: usize> {
+    pub q: Vec<Wn<L>>,
+    pub bits: Vec<Wn<L>>,
+    pub phase: Wn<L>,
+    /// 256 per sim: sim k's shot j is `angles[256 k + j]`.
     pub angles: Vec<u128>,
-    stack: Vec<W>,
-    rng: ChaCha8,
-    pub counts: Counts,
+    stack: Vec<Wn<L>>,
+    rng: Vec<ChaCha8>,
+    /// One per sim.
+    pub counts: Vec<Counts>,
 }
+
+pub type Sim = SimG<4>;
+pub type Sim2 = SimG<8>;
 
 impl Sim {
     pub fn new(prog: &Program, keys: Keys) -> Sim {
@@ -103,39 +160,101 @@ impl Sim {
     /// A sim with room for `num_qubits` qubits and `num_bits` compact bits, so several programs can run on it in
     /// turn (each program's ids are below its own counts; see `engine::run_sequence`).
     pub fn with_dims(num_qubits: usize, num_bits: usize, max_stack_depth: usize, keys: Keys) -> Sim {
-        Sim {
-            q: vec![W::ZERO; num_qubits.max(1)],
-            bits: vec![W::ZERO; num_bits.max(1)],
-            phase: W::ZERO,
-            angles: vec![0u128; 256],
+        SimG::with_keys(num_qubits, num_bits, max_stack_depth, vec![keys])
+    }
+}
+
+impl<const L: usize> SimG<L> {
+    /// `keys.len()` must equal `L / 4` (one ChaCha8 key set per sim).
+    pub fn with_keys(num_qubits: usize, num_bits: usize, max_stack_depth: usize, keys: Vec<Keys>) -> SimG<L> {
+        assert_eq!(keys.len(), L / 4, "one key set per sim");
+        let mut q = vec![Wn::<L>::ZERO; num_qubits + Q_OFF as usize];
+        q[Q_ONES as usize] = Wn::<L>::ONES;
+        let mut bits = vec![Wn::<L>::ZERO; num_bits + B_OFF as usize];
+        bits[B_ONES as usize] = Wn::<L>::ONES;
+        SimG {
+            q,
+            bits,
+            phase: Wn::<L>::ZERO,
+            angles: vec![0u128; 256 * (L / 4)],
             stack: Vec::with_capacity(max_stack_depth.max(8)),
-            rng: ChaCha8::new(keys),
-            counts: Counts::new(),
+            rng: keys.into_iter().map(ChaCha8::new).collect(),
+            counts: (0..L / 4).map(|_| Counts::new()).collect(),
         }
     }
 
-    /// kickmix `clear_for_shot`: zeroes qubits, bits, phase, angles, condition stack; the RNG stream continues.
+    /// Lockstep sims from a program.
+    pub fn new_lockstep(prog: &Program, keys: Vec<Keys>) -> SimG<L> {
+        SimG::with_keys(prog.num_qubits, prog.num_bits, prog.max_stack_depth, keys)
+    }
+
+    /// Qubit `i` (the array holds the constant slots first; see `program::Q_OFF`).
+    #[inline(always)]
+    pub fn qb(&self, i: usize) -> Wn<L> {
+        self.q[i + Q_OFF as usize]
+    }
+    #[inline(always)]
+    pub fn qb_mut(&mut self, i: usize) -> &mut Wn<L> {
+        &mut self.q[i + Q_OFF as usize]
+    }
+    /// Compact classical bit `i` (slot 0 of the array is the constant all-ones bit; see `program::B_OFF`).
+    #[inline(always)]
+    pub fn bt(&self, i: usize) -> Wn<L> {
+        self.bits[i + B_OFF as usize]
+    }
+    #[inline(always)]
+    pub fn bt_mut(&mut self, i: usize) -> &mut Wn<L> {
+        &mut self.bits[i + B_OFF as usize]
+    }
+    /// Number of compact classical bits this sim holds.
+    pub fn num_bits(&self) -> usize {
+        self.bits.len() - B_OFF as usize
+    }
+
+    /// kickmix `clear_for_shot`: zeroes qubits, bits, phase, angles, condition stack; the RNG streams continue.
     pub fn clear_for_shot(&mut self) {
-        self.q.fill(W::ZERO);
-        self.bits.fill(W::ZERO);
-        self.phase = W::ZERO;
+        self.q.fill(Wn::<L>::ZERO);
+        self.q[Q_ONES as usize] = Wn::<L>::ONES;
+        self.bits.fill(Wn::<L>::ZERO);
+        self.bits[B_ONES as usize] = Wn::<L>::ONES;
+        self.phase = Wn::<L>::ZERO;
         self.angles.fill(0);
         self.stack.clear();
     }
 
     /// Final phase per shot as kickmix `read_phase_flipped_across_shots` reads it: `Err` if any shot's phase is
     /// not a multiple of a half turn.
-    pub fn phase_flipped(&self, has_angles: bool) -> Result<W, String> {
-        self.phase_flipped_first(has_angles, 256)
+    pub fn phase_flipped(&self, has_angles: bool) -> Result<Wn<L>, String> {
+        self.phase_flipped_first(has_angles, 64 * L)
     }
 
-    /// `phase_flipped` over the first `n` shots only (the rest of the result is unspecified).
-    pub fn phase_flipped_first(&self, has_angles: bool, n: usize) -> Result<W, String> {
+    /// `phase_flipped` over the first `n` shots of every sim only (the rest of the result is unspecified).
+    pub fn phase_flipped_first(&self, has_angles: bool, n: usize) -> Result<Wn<L>, String> {
         if !has_angles {
             return Ok(self.phase);
         }
-        let mut out = W::ZERO;
-        for s in 0..n.min(256) {
+        let mut out = Wn::<L>::ZERO;
+        for s in 0..n.min(64 * L) {
+            let ph = (self.phase.0[s / 64] >> (s % 64)) & 1;
+            let v = self.angles[s] ^ ((ph as u128) << 127);
+            if v << 1 != 0 {
+                return Err("phase angles other than 0 and a half turn are present".into());
+            }
+            out.0[s / 64] |= ((v >> 127) as u64) << (s % 64);
+        }
+        Ok(out)
+    }
+
+    /// `phase_flipped` over the shots set in `lanes` only (the others are unspecified; for partial sims in lockstep).
+    pub fn phase_flipped_lanes(&self, has_angles: bool, lanes: Wn<L>) -> Result<Wn<L>, String> {
+        if !has_angles {
+            return Ok(self.phase);
+        }
+        let mut out = Wn::<L>::ZERO;
+        for s in 0..64 * L {
+            if (lanes.0[s / 64] >> (s % 64)) & 1 == 0 {
+                continue;
+            }
             let ph = (self.phase.0[s / 64] >> (s % 64)) & 1;
             let v = self.angles[s] ^ ((ph as u128) << 127);
             if v << 1 != 0 {
@@ -149,17 +268,17 @@ impl Sim {
     /// Run the program on this sim with the process's kernel (see `kernel`): the same body compiled for baseline
     /// x86-64, AVX2 (x86-64-v3) or AVX-512 (x86-64-v4); on aarch64 the single (NEON) build.
     pub fn run<const COUNT: bool>(&mut self, prog: &Program) {
-        self.dispatch::<COUNT, false>(prog, W::ONES)
+        self.dispatch::<COUNT, false>(prog, Wn::<L>::ONES)
     }
 
     /// Like `run`, but operation counts include only the shots set in `lanes` (kickmix counts only the first
     /// `batch_size` shots of its last, partly used 256-shot sim). The state of every lane is simulated as usual.
-    pub fn run_lanes<const COUNT: bool>(&mut self, prog: &Program, lanes: W) {
+    pub fn run_lanes<const COUNT: bool>(&mut self, prog: &Program, lanes: Wn<L>) {
         self.dispatch::<COUNT, true>(prog, lanes)
     }
 
     #[inline(always)]
-    fn dispatch<const COUNT: bool, const MASK: bool>(&mut self, prog: &Program, lanes: W) {
+    fn dispatch<const COUNT: bool, const MASK: bool>(&mut self, prog: &Program, lanes: Wn<L>) {
         #[cfg(target_arch = "x86_64")]
         {
             use crate::kernel::Kernel;
@@ -177,22 +296,24 @@ impl Sim {
 
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "avx2,bmi1,bmi2,fma,lzcnt,movbe")]
-    unsafe fn run_avx2<const COUNT: bool, const MASK: bool>(&mut self, prog: &Program, lanes: W) {
+    unsafe fn run_avx2<const COUNT: bool, const MASK: bool>(&mut self, prog: &Program, lanes: Wn<L>) {
         self.run_impl::<COUNT, MASK>(prog, lanes)
     }
 
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "avx2,bmi1,bmi2,fma,lzcnt,movbe,avx512f,avx512bw,avx512vl,avx512dq")]
-    unsafe fn run_avx512<const COUNT: bool, const MASK: bool>(&mut self, prog: &Program, lanes: W) {
+    unsafe fn run_avx512<const COUNT: bool, const MASK: bool>(&mut self, prog: &Program, lanes: Wn<L>) {
         self.run_impl::<COUNT, MASK>(prog, lanes)
     }
 
     /// The simulator loop. `inline(always)` so each kernel wrapper above gets its own copy compiled with its
-    /// target features (W's operations are `inline(always)` too and vectorise to the widest registers enabled).
+    /// target features (`Wn`'s operations are `inline(always)` too and vectorise to the widest registers enabled).
     /// With `MASK = false` (every caller except `run_lanes`) `lanes` is unused and the loop is the 0.4.0 loop; with
     /// `MASK = true` every count goes to the per-shot sums (`part`) restricted to `lanes`.
     #[inline(always)]
-    fn run_impl<const COUNT: bool, const MASK: bool>(&mut self, prog: &Program, lanes: W) {
+    fn run_impl<const COUNT: bool, const MASK: bool>(&mut self, prog: &Program, lanes: Wn<L>) {
+        const { assert!(L % 4 == 0 && L > 0) };
+        let ns = L / 4;
         let code = prog.code.as_ptr();
         let n = prog.code.len();
         let qp = self.q.as_mut_ptr();
@@ -202,25 +323,116 @@ impl Sim {
         let rng = &mut self.rng;
         let counts = &mut self.counts;
         let mut phase = self.phase;
-        let mut base = W::ONES;
+        let mut base = Wn::<L>::ONES;
         let mut full = true;
         let mut i = 0usize;
-        let nl = if MASK { lanes.popcnt() } else { 256 };
-        if COUNT {
-            // INFO_TAG: counted with an all-ones mask on every execution, no other effect.
-            if MASK {
-                counts.part[K_INFO as usize] += prog.n_info_tags * nl;
-            } else {
-                counts.full[K_INFO as usize] += prog.n_info_tags;
+        // Shots counted for a fully executed op, per sim (a partial last sim counts only its lanes).
+        let mut nls = [256u64; 8];
+        if MASK {
+            for s in 0..ns {
+                nls[s] = lanes.popcnt_sim(s);
             }
         }
-        // SAFETY: the Builder guarantees qubit ids < num_qubits (Sim::new sizes q from it), compact bit ids <
-        // num_bits, angle indices < angles.len(), every opcode has its OP_LEN words and run headers are followed
-        // by that many entries.
+        if COUNT {
+            // INFO_TAG: counted with an all-ones mask on every execution, no other effect.
+            for s in 0..ns {
+                if MASK {
+                    counts[s].part[K_INFO as usize] += prog.n_info_tags * nls[s];
+                } else {
+                    counts[s].full[K_INFO as usize] += prog.n_info_tags;
+                }
+            }
+        }
+        // Count helpers: `full` adds one executed op per sim, `part` the set shots of `cond` per sim.
+        macro_rules! count_full {
+            ($k:expr) => {
+                for s in 0..ns {
+                    counts[s].full[$k] += 1;
+                }
+            };
+        }
+        macro_rules! count_part {
+            ($k:expr, $cond:expr) => {{
+                let c = $cond;
+                for s in 0..ns {
+                    counts[s].part[$k] += c.popcnt_sim(s);
+                }
+            }};
+        }
+        // SAFETY: the Builder guarantees qubit slots < num_qubits + Q_OFF (the sim sizes q from it; uniform
+        // entries read slot Q_ONES and write the sink slots), bit slots < num_bits + B_OFF, angle indices <
+        // angles.len() / sims, every opcode has its OP_LEN words and run headers are followed by that many entries
+        // (`Program::validate` re-checks a loaded cache file).
         unsafe {
             while i < n {
                 let w0 = *code.add(i);
                 let opc = (w0 & 0xFF) as u8;
+                if opc == K_UNIRUN || opc == K_UNIRUN_IF {
+                    // Branch-free run of NEG/Z/X/CZ/CX/CCZ/CCX, bit-conditioned (K_UNIRUN_IF) or not:
+                    // `t = base & bits[cb] & q[a] & q[b] & q[c]; q[d] ^= t`, absent operands reading the all-ones
+                    // qubit slot; a phase entry's `d` is a sink slot, which also selects (without a branch) the XOR
+                    // of `t` into the register-resident phase. Counts: per (condition, kind, count) item, the
+                    // condition's shot count (one popcount per distinct condition) times the count, which equals
+                    // the per-op `cond.popcnt()` of the ordinary path.
+                    let cnt = (w0 >> 8) as usize;
+                    let nitems = *code.add(i + 1) as usize;
+                    let items = code.add(i + 2);
+                    let ent = code.add(i + 2 + UNI_ITEM * nitems);
+                    let ew = if opc == K_UNIRUN_IF { UNI_ENTRY_IF } else { UNI_ENTRY_PLAIN };
+                    i += 2 + UNI_ITEM * nitems + ew * cnt;
+                    if COUNT {
+                        let mut last_cb = usize::MAX;
+                        let mut m = [0u64; 8];
+                        let mut plain_full = false;
+                        for it in 0..nitems {
+                            let cb = *items.add(UNI_ITEM * it) as usize;
+                            let w = *items.add(UNI_ITEM * it + 1);
+                            let (k, n) = (UNI_KINDS[(w & 0xFF) as usize] as usize, (w >> 8) as u64);
+                            if cb != last_cb {
+                                last_cb = cb;
+                                plain_full = full && cb == B_ONES as usize && !MASK;
+                                if !plain_full {
+                                    let c = if MASK { base & *bp.add(cb) & lanes } else { base & *bp.add(cb) };
+                                    for s in 0..ns {
+                                        m[s] = c.popcnt_sim(s);
+                                    }
+                                }
+                            }
+                            if plain_full {
+                                for s in 0..ns {
+                                    counts[s].full[k] += n;
+                                }
+                            } else {
+                                for s in 0..ns {
+                                    counts[s].part[k] += n * m[s];
+                                }
+                            }
+                        }
+                    }
+                    if opc == K_UNIRUN_IF {
+                        for j in 0..cnt {
+                            let e0 = *ent.add(UNI_ENTRY_IF * j);
+                            let e1 = *ent.add(UNI_ENTRY_IF * j + 1);
+                            let cb = *ent.add(UNI_ENTRY_IF * j + 2) as usize;
+                            let d = (e1 >> 16) as usize;
+                            let t = base & *bp.add(cb) & *qp.add((e0 & 0xFFFF) as usize) & *qp.add((e0 >> 16) as usize) & *qp.add((e1 & 0xFFFF) as usize);
+                            let pm = Wn::<L>::splat(((d.wrapping_sub(Q_DUMMY as usize) < N_DUMMY as usize) as u64).wrapping_neg());
+                            phase ^= t & pm;
+                            *qp.add(d) ^= t;
+                        }
+                    } else {
+                        for j in 0..cnt {
+                            let e0 = *ent.add(UNI_ENTRY_PLAIN * j);
+                            let e1 = *ent.add(UNI_ENTRY_PLAIN * j + 1);
+                            let d = (e1 >> 16) as usize;
+                            let t = base & *qp.add((e0 & 0xFFFF) as usize) & *qp.add((e0 >> 16) as usize) & *qp.add((e1 & 0xFFFF) as usize);
+                            let pm = Wn::<L>::splat(((d.wrapping_sub(Q_DUMMY as usize) < N_DUMMY as usize) as u64).wrapping_neg());
+                            phase ^= t & pm;
+                            *qp.add(d) ^= t;
+                        }
+                    }
+                    continue;
+                }
                 if opc == K_CXRUN {
                     let cnt = (w0 >> 8) as usize;
                     let run = code.add(i + 1);
@@ -232,10 +444,12 @@ impl Sim {
                             *qp.add((r >> 16) as usize) ^= t;
                         }
                         if COUNT {
-                            if MASK {
-                                counts.part[K_CX as usize] += cnt as u64 * nl;
-                            } else {
-                                counts.full[K_CX as usize] += cnt as u64;
+                            for s in 0..ns {
+                                if MASK {
+                                    counts[s].part[K_CX as usize] += cnt as u64 * nls[s];
+                                } else {
+                                    counts[s].full[K_CX as usize] += cnt as u64;
+                                }
                             }
                         }
                     } else {
@@ -246,7 +460,9 @@ impl Sim {
                         }
                         if COUNT {
                             let m = if MASK { base & lanes } else { base };
-                            counts.part[K_CX as usize] += cnt as u64 * m.popcnt();
+                            for s in 0..ns {
+                                counts[s].part[K_CX as usize] += cnt as u64 * m.popcnt_sim(s);
+                            }
                         }
                     }
                     continue;
@@ -308,14 +524,14 @@ impl Sim {
                     K_INV => *bp.add(*code.add(i + 1) as usize) ^= cond,
                     K_HMR => {
                         let t = *code.add(i + 1) as usize;
-                        let r = W(rng.next());
+                        let r = Wn::<L>::from_rngs(rng);
                         let nb = (*bp.add(t) & !cond) ^ (r & cond);
                         *bp.add(t) = nb;
                         phase ^= *qp.add(a) & nb & cond;
                         *qp.add(a) &= !cond;
                     }
                     K_R => {
-                        let r = W(rng.next());
+                        let r = Wn::<L>::from_rngs(rng);
                         phase ^= *qp.add(a) & r & cond;
                         *qp.add(a) &= !cond;
                     }
@@ -325,15 +541,22 @@ impl Sim {
                         if COUNT {
                             let lv = *prog.levels.get_unchecked(idx) as usize;
                             if MASK {
-                                counts.zpart[lv] += if cfull { nl } else { (cond & lanes).popcnt() };
+                                let c = cond & lanes;
+                                for s in 0..ns {
+                                    counts[s].zpart[lv] += if cfull { nls[s] } else { c.popcnt_sim(s) };
+                                }
                             } else if cfull {
-                                counts.zfull[lv] += 1;
+                                for s in 0..ns {
+                                    counts[s].zfull[lv] += 1;
+                                }
                             } else {
-                                counts.zpart[lv] += cond.popcnt();
+                                for s in 0..ns {
+                                    counts[s].zpart[lv] += cond.popcnt_sim(s);
+                                }
                             }
                         }
                         let mask = *qp.add(a) & cond;
-                        for w in 0..4 {
+                        for w in 0..L {
                             let mut m = mask.0[w];
                             while m != 0 {
                                 let j = m.trailing_zeros() as usize;
@@ -347,7 +570,7 @@ impl Sim {
                         base &= *bp.add(*code.add(i + 1) as usize);
                         stack.push(base);
                         full = false;
-                        cond = W::ONES;
+                        cond = Wn::<L>::ONES;
                         cfull = true;
                     }
                     K_POP => {
@@ -358,11 +581,11 @@ impl Sim {
                                 full = false;
                             }
                             None => {
-                                base = W::ONES;
+                                base = Wn::<L>::ONES;
                                 full = true;
                             }
                         }
-                        cond = W::ONES;
+                        cond = Wn::<L>::ONES;
                         cfull = true;
                     }
                     _ => std::hint::unreachable_unchecked(),
@@ -371,11 +594,17 @@ impl Sim {
                 if COUNT {
                     let k = kind as usize;
                     if MASK {
-                        counts.part[k] += if cfull { nl } else { (cond & lanes).popcnt() };
+                        if cfull {
+                            for s in 0..ns {
+                                counts[s].part[k] += nls[s];
+                            }
+                        } else {
+                            count_part!(k, cond & lanes);
+                        }
                     } else if cfull {
-                        counts.full[k] += 1;
+                        count_full!(k);
                     } else {
-                        counts.part[k] += cond.popcnt();
+                        count_part!(k, cond);
                     }
                 }
             }
