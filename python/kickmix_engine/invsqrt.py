@@ -5,7 +5,10 @@ functions are used for the spec, seeds (`_initial_seed` and the SeedSequence spl
 inputs (`sample_shots`), the reference table (`reference_values`) and the cost model (`rotation_t_count`). The
 engine replaces `km.Simulator`: one engine chunk = one kickmix `Simulator(batch_size=256, seed)` running the chunk's
 batches in order (proven per shot in M1 gate 1). Phases arrive as the verifier's 2^-64-turn integers
-(`half_turns_to_units(read_shot_phase(i))`, also proven in M1). Differences from the official path:
+(`half_turns_to_units(read_shot_phase(i))`, also proven in M1). The per-shot check itself (x restored, scratch
+clean, |theta - target(x)| <= tol(x), the failure order within a batch, the min-margin and worst-ratio folds) runs on
+the engine (`run(..., check=(target, tol))`, see `engine::Check`); Python only merges the per-chunk results, exactly
+as the verifier merges its per-chunk results. Differences from the official path:
 - the circuit is compiled from the .kmb file by the engine (no kickmix Circuit);
 - the seed hash is the SHA-256 of the file bytes (the verifier hashes kickmix's re-serialisation; equal for
   canonical .kmb files, which `--cross-check` confirms per run);

@@ -107,7 +107,7 @@ fn derive_keys<'py>(py: Python<'py>, seed: [u32; 8], nsims: usize) -> Bound<'py,
 /// per-chunk `check_min_margin`, `check_worst_ratio`, `check_worst_x` and `check_fail` [n_chunks * 6] instead of
 /// the per-shot arrays (see `engine::CheckOut`).
 #[pyfunction]
-#[pyo3(signature = (prog, seeds, xs, xreg, s, b, threads=1, counting=true, dump=false, check=None))]
+#[pyo3(signature = (prog, seeds, xs, xreg, s, b, threads=1, counting=true, dump=false, check=None, lockstep=true))]
 #[allow(clippy::too_many_arguments)]
 fn run<'py>(
     py: Python<'py>,
@@ -121,6 +121,7 @@ fn run<'py>(
     counting: bool,
     dump: bool,
     check: Option<(PyReadonlyArray1<'py, u64>, PyReadonlyArray1<'py, u64>)>,
+    lockstep: bool,
 ) -> PyResult<Bound<'py, PyDict>> {
     let sd = seeds.as_array();
     if sd.ncols() != 8 {
@@ -139,7 +140,7 @@ fn run<'py>(
     let p = prog.inner.clone();
     let out = py
         .detach(|| {
-            let spec = engine::RunSpec { prog: &p, seeds: &seeds_v, s, b, xs: xs_s, xreg: &xreg, counting, dump, threads, check: ck.as_ref() };
+            let spec = engine::RunSpec { prog: &p, seeds: &seeds_v, s, b, xs: xs_s, xreg: &xreg, counting, dump, threads, check: ck.as_ref(), lockstep };
             engine::run(&spec)
         })
         .map_err(PyValueError::new_err)?;

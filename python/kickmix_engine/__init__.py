@@ -57,7 +57,7 @@ def compile_circuit(circuit) -> Program:
 
 
 def run(prog: Program, seeds, xs, xreg, *, s: int = 1, threads: int = 1, counting: bool = True, dump: bool = False,
-        check=None):
+        check=None, lockstep: bool = True):
     """Run chunks. seeds: uint32 [n_chunks, 8] (or python ints); xs: uint64 [n_chunks, B, 256*s].
 
     Returns dict of arrays shaped like xs: x_out (register read back), scratch_dirty (any scratch qubit nonzero),
@@ -70,6 +70,7 @@ def run(prog: Program, seeds, xs, xreg, *, s: int = 1, threads: int = 1, countin
     (min tol - |error|), ``check_worst_ratio`` and ``check_worst_x`` [n_chunks] (largest |error| / tol, smallest x
     on ties) and ``check_fail`` int64 [n_chunks, 6]: batch (-1 if the chunk passed), priority (0 x not restored,
     1 scratch dirty, 2 phase out of tolerance), shot, x, error, allowed, for the first failing batch of the chunk.
+    ``lockstep=False`` runs every 256-shot sim alone instead of in pairs (identical results; for tests and timing).
     """
     seeds = np.asarray([seed_words(x) if isinstance(x, int) else x for x in seeds], dtype=np.uint32).reshape(-1, 8)
     xs = np.ascontiguousarray(xs, dtype=np.uint64)
@@ -77,7 +78,7 @@ def run(prog: Program, seeds, xs, xreg, *, s: int = 1, threads: int = 1, countin
     assert per == 256 * s and n_chunks == len(seeds)
     if check is not None:
         check = (np.ascontiguousarray(check[0], dtype=np.uint64), np.ascontiguousarray(check[1], dtype=np.uint64))
-    r = _run(prog, seeds, xs.reshape(-1), [int(q) for q in xreg], s, b, threads, counting, dump, check)
+    r = _run(prog, seeds, xs.reshape(-1), [int(q) for q in xreg], s, b, threads, counting, dump, check, lockstep)
     out = {k: v.reshape(n_chunks, b, per) for k, v in r.items() if k in ("x_out", "scratch_dirty", "phase_units")}
     if check is not None:
         out["check_min_margin"] = r["check_min_margin"]

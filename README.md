@@ -248,6 +248,21 @@ A typical agent flow: fetch the manifest, take `manifest.match.url` and `sha256`
 (or match `platform_tag` yourself), install, check that `test_status.per_kernel[<selected kernel>]` is `passed`, then
 run `verify ... --cross-check` once on a known circuit.
 
+### Resident engine (loops of `diff`, `profile`, `verify`)
+
+```sh
+kickmix-engine serve --socket /tmp/ke.sock &          # one process, compiled programs and reference tables stay in memory
+kickmix-engine --via /tmp/ke.sock diff dqi BASE.kmb CAND.kmb --profile P.json --threads 4
+kickmix-engine --via /tmp/ke.sock ping | stats | stop
+```
+
+A served command prints exactly what the one-shot command prints and exits with the same code (the server runs the
+ordinary CLI with its output captured); only the timing fields inside the JSON differ. The process keeps compiled
+programs by content hash (an unchanged file, by realpath, size, mtime_ns and inode, is not re-read or re-hashed),
+task plug-ins with their reference tables (invsqrt's `reference_values`, about 1.2 s) and parsed profile JSONs;
+`--max-programs` bounds the LRU. Requests are served one at a time. From Python:
+`kickmix_engine.resident.Client('/tmp/ke.sock').json(['diff', 'dqi', base, cand, '--profile', p])`.
+
 ## Measured results
 
 Full DQI verification of `4ee7a17b4cbc` (889 qubits, 55.8M ops, 102,400 shots, empty salt) on an Apple M2 Pro (6
@@ -380,10 +395,16 @@ skipped. The parity scripts below honour the same variable.
   kickmix's semantics: condition stack, 128-bit fixed-point angles, global phase, HMR/R outcomes from kickmix's random
   number chain (std::seed_seq, mt19937_64, then ChaCha8 keys per 256-shot simulator) and exact per-kind operation
   counts. Batches run in parallel with Rayon, and the GIL is released while they run. `run_sequence` keeps each
-  256-shot simulator alive across several programs (the chemistry task's 30 circuit runs).
-- **Compiler** (`src/program.rs`): streams a `.kmb` file into a compact u32 instruction stream, with compacted
-  classical-bit ids and runs of plain CX. In the same pass it computes kickmix's `reaction_depth`, which is stored
-  with the cached program.
+  256-shot simulator alive across several programs (the chemistry task's 30 circuit runs). The word type is generic
+  over its width (`Wn<L>`): `run` (the invsqrt chunk model) simulates two independent 256-shot sims per op in
+  lockstep (`Wn<8>`: one decode, two states, two RNG streams, two sets of counts), which overlaps the
+  read-modify-write chains of arithmetic-heavy circuits; the results are the two single runs' results.
+- **Compiler** (`src/program.rs`): streams a `.kmb` file into a compact u32 instruction stream with compacted
+  classical-bit ids. NEG, Z, X, CZ, CX, CCZ and CCX ops, bit-conditioned or not, become *uniform runs* that the
+  simulator executes without a data-dependent branch (`t = base & bits[cb] & q[a] & q[b] & q[c]; q[d] ^= t`,
+  with constant all-ones slots for absent operands and rotating sink slots for phase ops; counts from one popcount
+  per condition group times a static histogram); long plain-CX stretches stay CX runs. In the same pass it computes
+  kickmix's `reaction_depth`, which is stored with the cached program.
 - **DQI sampler** (`src/dqi_sample.rs`): an exact re-implementation of the verifier's `sample_shots` on NumPy's PCG64
   stream, fused with the simulation.
 - **Task adapters** (`python/kickmix_engine/dqi.py`, `invsqrt.py`, `dfthcsos.py`): load the official verifier module
@@ -395,7 +416,7 @@ skipped. The parity scripts below honour the same variable.
 - invsqrt and DQI: only `.kmb` input and `--batch-size 256`. dfthcsos: `.kmb` directories use the program cache;
   `.kmx` files and in-memory circuits are compiled from kickmix's text form; word registers wider than 62 bits are
   not supported. The chemistry speed-up depends on the FCIDUMP cache: the first run on a machine parses the file
-  as the official verifier does. DEBUG_PRINT ops are rejected. Qubit ids must be below 65,536.
+  as the official verifier does. DEBUG_PRINT ops are rejected. Qubit ids must be below 65,527.
 - kickmix must be importable, because the official verifier modules import it.
 - `circuit_sha256` is the SHA-256 of the file bytes. The official verifier hashes kickmix's re-serialisation of the
   circuit. The two are equal for canonical `.kmb` files (as written by kickmix), and `--cross-check` compares them on

@@ -3,6 +3,40 @@
 All notable changes to kickmix-engine. Dates are UTC. The project was written by an AI model (Claude) under the
 owner's direction; see NOTICE.
 
+## Unreleased (branch `perf-invsqrt-resident`, 2026-11-03; on top of `paired-runner`)
+
+### Changed (simulator speed; cache format 3)
+- **Uniform runs.** The compiler gathers NEG, Z, X, CZ, CX, CCZ and CCX ops, with or without a bit condition, into
+  runs of three-word entries that the simulator executes without a data-dependent branch:
+  `t = base & bits[cb] & q[a] & q[b] & q[c]; q[d] ^= t`. The qubit array now starts with a constant all-ones slot
+  (absent operands) and eight rotating write-only sinks (phase ops XOR into a sink and, through a mask derived from
+  the sink index, into the register-resident phase); the bit array starts with a constant all-ones bit. Counts come
+  from one popcount per condition group times the run's static histogram, which equals the ordinary path's per-op
+  popcounts. Plain CX stretches of eight or more remain CX runs. Qubit ids must now be below 65,527.
+- **Lockstep pairs.** `run` (the invsqrt chunk model) simulates two independent 256-shot sims per op (`SimG<8>`,
+  one decode, two states, own RNG streams and counts), which lets the core overlap the read-modify-write chains of
+  arithmetic-heavy circuits. `run(..., lockstep=False)` keeps the single-sim path; results are identical.
+- Measured on the frontier invsqrt circuit `bce2948ff24e` (Apple M2 Pro, loaded machine, 1 thread, per 256-shot
+  batch with counting): 242 us before, 166 us with uniform runs, 111 us with lockstep pairs (2.17x).
+  Synthetic: a random CX/CZ/CCX/X/Z mix 6.5 -> 1.6 ns per op per 256 shots. The NumPy per-x check that the card
+  named as the bottleneck measured about 1% of invsqrt wall time.
+
+### Added
+- `run(..., check=(target, tol))` (Rust `engine::Check`): the invsqrt verifier's per-shot check on the engine
+  (x restored, scratch clean, |theta - target(x)| <= tol(x) in 2^-64-turn units with the verifier's wrapping
+  arithmetic, its failure order within a batch, min margin and worst-ratio folds), returned per chunk; the adapter
+  no longer moves 200M per-shot words into NumPy. `Program.num_uni_runs`.
+- **Resident engine.** `kickmix-engine serve --socket PATH [--max-programs N]` keeps one process alive;
+  `kickmix-engine --via PATH <command>` runs any command there (`ping`, `stats`, `stop` are control requests). The
+  server runs the ordinary CLI with captured output, so a served command prints what the one-shot CLI prints and
+  exits with its code. It keeps compiled programs by content hash (unchanged files, by realpath, size, mtime_ns and
+  inode, are not re-read), task plug-ins with their reference tables and parsed profile JSONs (`cache.Memory`).
+  Python: `kickmix_engine.resident.Client(socket).call(argv) / .json(argv)`.
+- Tests: `tests/test_invsqrt_check.py` (engine check against the NumPy restatement: pass folds, zero tolerance,
+  phase/x/dirty failures and their priority, first failing chunk and batch, bad inputs; uniform runs with
+  bit-conditioned gates), `tests/test_resident.py` (served output equals one-shot, memory hits, error relay,
+  `--via`). The existing suite is unchanged and passes.
+
 ## Unreleased (branch `paired-runner`, 2026-11-03)
 
 ### Added

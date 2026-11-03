@@ -23,6 +23,8 @@ pub struct RunSpec<'a> {
     pub threads: usize,
     /// invsqrt per-shot check on the engine (see `Check`); then `x_out`, `dirty` and `units` are not produced.
     pub check: Option<&'a Check<'a>>,
+    /// Run chunk sims in lockstep pairs (`SimG<8>`); false runs every sim alone (same results, for tests).
+    pub lockstep: bool,
 }
 
 /// The official invsqrt per-shot check, restated: shot with input `x` passes if the x register reads back `x`, no
@@ -108,6 +110,18 @@ impl<T> SP<T> {
     }
 }
 
+/// Output pointers shared by the unit tasks (each writes disjoint ranges).
+#[derive(Clone, Copy)]
+struct OutPtrs {
+    px: SP<u64>,
+    pd: SP<u8>,
+    pu: SP<u64>,
+    dq: SP<u64>,
+    dbits: SP<u64>,
+    dph: SP<u64>,
+    dv: SP<u64>,
+}
+
 pub fn run(spec: &RunSpec) -> Result<Out, String> {
     crate::kernel::selected()?;
     let nch = spec.seeds.len();
@@ -152,14 +166,23 @@ pub fn run(spec: &RunSpec) -> Result<Out, String> {
         dump.phase = vec![0; nunits_batches * 4];
         dump.vphase = vec![0; nunits_batches * 256 * 2];
     }
-    let (px, pd, pu) = (SP(x_out.as_mut_ptr()), SP(dirty.as_mut_ptr()), SP(units.as_mut_ptr()));
-    let (dq, dbits, dph, dv) = (SP(dump.q.as_mut_ptr()), SP(dump.bits.as_mut_ptr()), SP(dump.phase.as_mut_ptr()), SP(dump.vphase.as_mut_ptr()));
+    let ptrs = OutPtrs {
+        px: SP(x_out.as_mut_ptr()),
+        pd: SP(dirty.as_mut_ptr()),
+        pu: SP(units.as_mut_ptr()),
+        dq: SP(dump.q.as_mut_ptr()),
+        dbits: SP(dump.bits.as_mut_ptr()),
+        dph: SP(dump.phase.as_mut_ptr()),
+        dv: SP(dump.vphase.as_mut_ptr()),
+    };
 
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(spec.threads.max(1))
         .build()
         .map_err(|e| e.to_string())?;
-    let results: Vec<(Counts, UnitCheck)> = pool.install(|| {
+    let nunits = nch * s;
+    let lockstep = spec.lockstep;
+    let results: Vec<Vec<(Counts, UnitCheck)>> = pool.install(|| {
         // Per-chunk: the master stream hands out 4 draws per sim, in order.
         let sim_seeds: Vec<Vec<[u32; 8]>> = spec
             .seeds
@@ -169,132 +192,25 @@ pub fn run(spec: &RunSpec) -> Result<Out, String> {
                 (0..s).map(|_| sim_seed_words(&mut master)).collect()
             })
             .collect();
-        (0..nch * s)
+        // Units (one 256-shot sim each) run in lockstep pairs; a trailing single unit runs alone.
+        let npairs = if lockstep { nunits / 2 } else { 0 };
+        let ntasks = npairs + (nunits - 2 * npairs);
+        (0..ntasks)
             .into_par_iter()
             .with_min_len(1)
-            .map(|u| {
-                let (chunk, k) = (u / s, u % s);
-                let keys = keys_from_sim_seed(&sim_seeds[chunk][k]);
-                let mut sim = Sim::new(spec.prog, keys);
-                let width = spec.xreg.len();
-                let mut rows = [0u64; 64];
-                let mut uc = UnitCheck::new();
-                for b in 0..bb {
-                    let off = (chunk * bb + b) * shots_per_batch + k * 256;
-                    let ub = (chunk * bb + b) * s + k;
-                    sim.clear_for_shot();
-                    for w in 0..4 {
-                        rows.copy_from_slice(&spec.xs[off + 64 * w..off + 64 * w + 64]);
-                        transpose64(&mut rows);
-                        for i in 0..width {
-                            sim.qb_mut(spec.xreg[i] as usize).0[w] = rows[i];
-                        }
-                    }
-                    if spec.counting {
-                        sim.run::<true>(spec.prog);
-                    } else {
-                        sim.run::<false>(spec.prog);
-                    }
-                    let mut dw = W::ZERO;
-                    for &i in &scratch {
-                        dw = dw | sim.qb(i);
-                    }
-                    if let Some(ck) = spec.check {
-                        // The verifier's per-batch check in its order: x restored, scratch clean, phase in
-                        // tolerance; margins and the worst ratio over every shot of a passing batch.
-                        let mut bad_x = false;
-                        for w in 0..4 {
-                            rows = [0u64; 64];
-                            for i in 0..width {
-                                rows[i] = sim.qb(spec.xreg[i] as usize).0[w];
-                            }
-                            transpose64(&mut rows);
-                            for r in 0..64 {
-                                bad_x |= rows[r] != spec.xs[off + 64 * w + r];
-                            }
-                        }
-                        let mut fail: Option<(usize, u8, usize, u64, i64, u64)> = None;
-                        if bad_x {
-                            fail = Some((b, 0, 0, 0, 0, 0));
-                        } else if dw != W::ZERO {
-                            let sh = (0..256).find(|&sh| (dw.0[sh / 64] >> (sh % 64)) & 1 != 0).unwrap();
-                            fail = Some((b, 1, sh, spec.xs[off + sh], 0, 0));
-                        }
-                        if fail.is_none() {
-                            for sh in 0..256 {
-                                let ph = (sim.phase.0[sh / 64] >> (sh % 64)) & 1;
-                                let v = sim.angles[sh] ^ ((ph as u128) << 127);
-                                let theta = (((v >> 63) + 1) >> 1) as u64;
-                                let x = spec.xs[off + sh];
-                                let idx = (x - 1) as usize;
-                                let (target, allowed) = (ck.target[idx], ck.tol[idx]);
-                                let err = theta.wrapping_sub(target) as i64;
-                                let used = err.unsigned_abs();
-                                if used > allowed {
-                                    fail = Some((b, 2, sh, x, err, allowed));
-                                    break;
-                                }
-                                uc.min_margin = uc.min_margin.min(allowed - used);
-                                let ratio = if allowed > 0 { used as f64 / allowed as f64 } else { 0.0 };
-                                if ratio > uc.worst_ratio || (ratio == uc.worst_ratio && x < uc.worst_x) {
-                                    uc.worst_ratio = ratio;
-                                    uc.worst_x = x;
-                                }
-                            }
-                        }
-                        if fail.is_some() {
-                            uc.fail = fail;
-                            break;
-                        }
-                        continue;
-                    }
-                    // SAFETY: each (chunk, batch, k) writes a disjoint range of the outputs.
-                    unsafe {
-                        for w in 0..4 {
-                            rows = [0u64; 64];
-                            for i in 0..width {
-                                rows[i] = sim.qb(spec.xreg[i] as usize).0[w];
-                            }
-                            transpose64(&mut rows);
-                            for r in 0..64 {
-                                *px.p().add(off + 64 * w + r) = rows[r];
-                            }
-                        }
-                        for sh in 0..256 {
-                            let ph = (sim.phase.0[sh / 64] >> (sh % 64)) & 1;
-                            let v = sim.angles[sh] ^ ((ph as u128) << 127);
-                            *pu.p().add(off + sh) = (((v >> 63) + 1) >> 1) as u64;
-                            *pd.p().add(off + sh) = ((dw.0[sh / 64] >> (sh % 64)) & 1) as u8;
-                            if spec.dump {
-                                *dv.p().add(ub * 512 + sh * 2) = v as u64;
-                                *dv.p().add(ub * 512 + sh * 2 + 1) = (v >> 64) as u64;
-                            }
-                        }
-                        if spec.dump {
-                            for i in 0..nq {
-                                for w in 0..4 {
-                                    *dq.p().add((ub * nq + i) * 4 + w) = sim.qb(i).0[w];
-                                }
-                            }
-                            for i in 0..spec.prog.num_bits {
-                                for w in 0..4 {
-                                    *dbits.p().add((ub * nb + i) * 4 + w) = sim.bt(i).0[w];
-                                }
-                            }
-                            for w in 0..4 {
-                                *dph.p().add(ub * 4 + w) = sim.phase.0[w];
-                            }
-                        }
-                    }
+            .map(|t| {
+                if t < npairs {
+                    run_units::<8>(spec, &[2 * t, 2 * t + 1], &sim_seeds, &scratch, ptrs)
+                } else {
+                    run_units::<4>(spec, &[2 * npairs + (t - npairs)], &sim_seeds, &scratch, ptrs)
                 }
-                (sim.counts, uc)
             })
             .collect()
     });
     let mut kind_counts = vec![0u64; nch * NCOUNT];
     let mut z_levels = vec![0u64; nch * 129];
     let mut chunk_checks = vec![UnitCheck::new(); if checking { nch } else { 0 }];
-    for (u, (c, uc)) in results.iter().enumerate() {
+    for (u, (c, uc)) in results.iter().flatten().enumerate() {
         let chunk = u / s;
         for (i, v) in c.kinds().iter().enumerate() {
             kind_counts[chunk * NCOUNT + i] += v;
@@ -322,6 +238,146 @@ pub fn run(spec: &RunSpec) -> Result<Out, String> {
         None
     };
     Ok(Out { x_out, dirty, units, kind_counts, z_levels, dump, check })
+}
+
+/// `L / 4` units (chunk sims, `unit = chunk * s + k`) through all `bb` batches on one lockstep `SimG<L>`: inputs
+/// written per sim, the program run once per batch, outputs (or the invsqrt check) read per sim. Returns one
+/// (counts, check) per unit, in `units` order.
+fn run_units<const L: usize>(spec: &RunSpec, units: &[usize], sim_seeds: &[Vec<[u32; 8]>], scratch: &[usize], p: OutPtrs) -> Vec<(Counts, UnitCheck)> {
+    let ns = L / 4;
+    debug_assert_eq!(units.len(), ns);
+    let (s, bb) = (spec.s, spec.b);
+    let shots_per_batch = 256 * s;
+    let nq = spec.prog.num_qubits;
+    let nb = spec.prog.num_bits.max(1);
+    let keys: Vec<_> = units.iter().map(|&u| keys_from_sim_seed(&sim_seeds[u / s][u % s])).collect();
+    let mut sim = SimG::<L>::new_lockstep(spec.prog, keys);
+    let width = spec.xreg.len();
+    let mut rows = [0u64; 64];
+    let mut ucs = vec![UnitCheck::new(); ns];
+    let mut done = vec![false; ns];
+    let off_of = |u: usize, b: usize| (((u / s) * bb + b) * shots_per_batch) + (u % s) * 256;
+    for b in 0..bb {
+        sim.clear_for_shot();
+        for (si, &u) in units.iter().enumerate() {
+            let off = off_of(u, b);
+            for w in 0..4 {
+                rows.copy_from_slice(&spec.xs[off + 64 * w..off + 64 * w + 64]);
+                transpose64(&mut rows);
+                for i in 0..width {
+                    sim.qb_mut(spec.xreg[i] as usize).0[4 * si + w] = rows[i];
+                }
+            }
+        }
+        if spec.counting {
+            sim.run::<true>(spec.prog);
+        } else {
+            sim.run::<false>(spec.prog);
+        }
+        let mut dw = Wn::<L>::ZERO;
+        for &i in scratch {
+            dw = dw | sim.qb(i);
+        }
+        for (si, &u) in units.iter().enumerate() {
+            if done[si] {
+                continue;
+            }
+            let off = off_of(u, b);
+            let ub = ((u / s) * bb + b) * s + u % s;
+            if let Some(ck) = spec.check {
+                // The verifier's per-batch check in its order: x restored, scratch clean, phase in tolerance;
+                // margins and the worst ratio over every shot of a passing batch.
+                let mut bad_x = false;
+                for w in 0..4 {
+                    rows = [0u64; 64];
+                    for i in 0..width {
+                        rows[i] = sim.qb(spec.xreg[i] as usize).0[4 * si + w];
+                    }
+                    transpose64(&mut rows);
+                    for r in 0..64 {
+                        bad_x |= rows[r] != spec.xs[off + 64 * w + r];
+                    }
+                }
+                let uc = &mut ucs[si];
+                let mut fail: Option<(usize, u8, usize, u64, i64, u64)> = None;
+                if bad_x {
+                    fail = Some((b, 0, 0, 0, 0, 0));
+                } else if dw.sim(si) != W::ZERO {
+                    let sh = (0..256).find(|&sh| (dw.0[4 * si + sh / 64] >> (sh % 64)) & 1 != 0).unwrap();
+                    fail = Some((b, 1, sh, spec.xs[off + sh], 0, 0));
+                }
+                if fail.is_none() {
+                    for sh in 0..256 {
+                        let ph = (sim.phase.0[4 * si + sh / 64] >> (sh % 64)) & 1;
+                        let v = sim.angles[256 * si + sh] ^ ((ph as u128) << 127);
+                        let theta = (((v >> 63) + 1) >> 1) as u64;
+                        let x = spec.xs[off + sh];
+                        let idx = (x - 1) as usize;
+                        let (target, allowed) = (ck.target[idx], ck.tol[idx]);
+                        let err = theta.wrapping_sub(target) as i64;
+                        let used = err.unsigned_abs();
+                        if used > allowed {
+                            fail = Some((b, 2, sh, x, err, allowed));
+                            break;
+                        }
+                        uc.min_margin = uc.min_margin.min(allowed - used);
+                        let ratio = if allowed > 0 { used as f64 / allowed as f64 } else { 0.0 };
+                        if ratio > uc.worst_ratio || (ratio == uc.worst_ratio && x < uc.worst_x) {
+                            uc.worst_ratio = ratio;
+                            uc.worst_x = x;
+                        }
+                    }
+                }
+                if fail.is_some() {
+                    uc.fail = fail;
+                    done[si] = true;
+                }
+                continue;
+            }
+            // SAFETY: each (chunk, batch, k) writes a disjoint range of the outputs.
+            unsafe {
+                for w in 0..4 {
+                    rows = [0u64; 64];
+                    for i in 0..width {
+                        rows[i] = sim.qb(spec.xreg[i] as usize).0[4 * si + w];
+                    }
+                    transpose64(&mut rows);
+                    for r in 0..64 {
+                        *p.px.p().add(off + 64 * w + r) = rows[r];
+                    }
+                }
+                for sh in 0..256 {
+                    let ph = (sim.phase.0[4 * si + sh / 64] >> (sh % 64)) & 1;
+                    let v = sim.angles[256 * si + sh] ^ ((ph as u128) << 127);
+                    *p.pu.p().add(off + sh) = (((v >> 63) + 1) >> 1) as u64;
+                    *p.pd.p().add(off + sh) = ((dw.0[4 * si + sh / 64] >> (sh % 64)) & 1) as u8;
+                    if spec.dump {
+                        *p.dv.p().add(ub * 512 + sh * 2) = v as u64;
+                        *p.dv.p().add(ub * 512 + sh * 2 + 1) = (v >> 64) as u64;
+                    }
+                }
+                if spec.dump {
+                    for i in 0..nq {
+                        for w in 0..4 {
+                            *p.dq.p().add((ub * nq + i) * 4 + w) = sim.qb(i).0[4 * si + w];
+                        }
+                    }
+                    for i in 0..spec.prog.num_bits {
+                        for w in 0..4 {
+                            *p.dbits.p().add((ub * nb + i) * 4 + w) = sim.bt(i).0[4 * si + w];
+                        }
+                    }
+                    for w in 0..4 {
+                        *p.dph.p().add(ub * 4 + w) = sim.phase.0[4 * si + w];
+                    }
+                }
+            }
+        }
+        if spec.check.is_some() && done.iter().all(|&d| d) {
+            break;
+        }
+    }
+    (0..ns).map(|si| (sim.counts[si].clone(), ucs[si])).collect()
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -421,8 +477,8 @@ pub fn run_batches(spec: &BatchSpec) -> Result<BatchOut, String> {
                     Ok(x) => x,
                     Err(e) => return Some(format!("batch {}: {}", b, e)),
                 };
-                let kc = sim.counts.kinds();
-                let zl = sim.counts.zlevels();
+                let kc = sim.counts[0].kinds();
+                let zl = sim.counts[0].zlevels();
                 // SAFETY: batch b writes only its own disjoint slices.
                 unsafe {
                     for w in 0..4 {
@@ -481,10 +537,10 @@ pub fn simulate_batch<'p>(
     let keys = keys_from_sim_seed(&sim_seed_words(&mut master));
     let mut sim = Sim::new(p, keys);
     for (j, &q) in qin_ids.iter().enumerate() {
-        *sim.qb_mut(q as usize) = W([qin[4 * j], qin[4 * j + 1], qin[4 * j + 2], qin[4 * j + 3]]);
+        *sim.qb_mut(q as usize) = Wn([qin[4 * j], qin[4 * j + 1], qin[4 * j + 2], qin[4 * j + 3]]);
     }
     for (j, &c) in bin_ids.iter().enumerate() {
-        *sim.bt_mut(c as usize) = W([bin[4 * j], bin[4 * j + 1], bin[4 * j + 2], bin[4 * j + 3]]);
+        *sim.bt_mut(c as usize) = Wn([bin[4 * j], bin[4 * j + 1], bin[4 * j + 2], bin[4 * j + 3]]);
     }
     if counting {
         sim.run::<true>(p);
@@ -493,7 +549,7 @@ pub fn simulate_batch<'p>(
     }
     let mut bad = W::ZERO;
     for (j, &q) in qin_ids.iter().enumerate() {
-        bad = bad | (sim.qb(q as usize) ^ W([qin[4 * j], qin[4 * j + 1], qin[4 * j + 2], qin[4 * j + 3]]));
+        bad = bad | (sim.qb(q as usize) ^ Wn([qin[4 * j], qin[4 * j + 1], qin[4 * j + 2], qin[4 * j + 3]]));
     }
     for &i in others {
         bad = bad | sim.qb(i);
@@ -579,8 +635,8 @@ pub fn run_dqi(spec: &DqiSpec) -> Result<DqiOut, String> {
                     Ok(x) => x,
                     Err(e) => return Some(format!("batch {}: {}", b, e)),
                 };
-                let kc = sim.counts.kinds();
-                let zl = sim.counts.zlevels();
+                let kc = sim.counts[0].kinds();
+                let zl = sim.counts[0].zlevels();
                 // SAFETY: batch b writes only its own disjoint slices.
                 unsafe {
                     for w in 0..4 {
@@ -820,9 +876,9 @@ pub fn run_sequence(spec: &SeqSpec) -> Result<SeqOut, String> {
                             }
                         }
                     }
-                    kc.push(sim.counts.kinds());
-                    zl.push(sim.counts.zlevels());
-                    sim.counts = Counts::new();
+                    kc.push(sim.counts[0].kinds());
+                    zl.push(sim.counts[0].zlevels());
+                    sim.counts[0] = Counts::new();
                 }
                 Ok((kc, zl))
             })
