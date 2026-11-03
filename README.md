@@ -396,15 +396,17 @@ skipped. The parity scripts below honour the same variable.
   number chain (std::seed_seq, mt19937_64, then ChaCha8 keys per 256-shot simulator) and exact per-kind operation
   counts. Batches run in parallel with Rayon, and the GIL is released while they run. `run_sequence` keeps each
   256-shot simulator alive across several programs (the chemistry task's 30 circuit runs). The word type is generic
-  over its width (`Wn<L>`): `run` (the invsqrt chunk model) simulates two independent 256-shot sims per op in
-  lockstep (`Wn<8>`: one decode, two states, two RNG streams, two sets of counts), which overlaps the
-  read-modify-write chains of arithmetic-heavy circuits; the results are the two single runs' results.
+  over its width (`Wn<L>`): every driver simulates two independent 256-shot sims per op in lockstep (`Wn<8>`: one
+  decode, two states, two RNG streams, two sets of counts), which overlaps the read-modify-write chains of
+  arithmetic-heavy circuits and halves the instruction-stream reads per sim; the results are the two single runs'
+  results (`lockstep=False` runs them singly).
 - **Compiler** (`src/program.rs`): streams a `.kmb` file into a compact u32 instruction stream with compacted
   classical-bit ids. NEG, Z, X, CZ, CX, CCZ and CCX ops, bit-conditioned or not, become *uniform runs* that the
   simulator executes without a data-dependent branch (`t = base & bits[cb] & q[a] & q[b] & q[c]; q[d] ^= t`,
-  with constant all-ones slots for absent operands and rotating sink slots for phase ops; counts from one popcount
-  per condition group times a static histogram); long plain-CX stretches stay CX runs. In the same pass it computes
-  kickmix's `reaction_depth`, which is stored with the cached program.
+  with constant all-ones slots for absent operands and rotating sink slots for phase ops; two-word entries when no
+  entry is conditioned, three-word otherwise; counts from (condition, kind, count) items with one popcount per
+  distinct condition); plain-CX stretches of two or more stay one-word CX runs. In the same pass it computes
+  kickmix's `reaction_depth`, which is stored with the cached program. `Program.stream_stats()` reports the mix.
 - **DQI sampler** (`src/dqi_sample.rs`): an exact re-implementation of the verifier's `sample_shots` on NumPy's PCG64
   stream, fused with the simulation.
 - **Task adapters** (`python/kickmix_engine/dqi.py`, `invsqrt.py`, `dfthcsos.py`): load the official verifier module

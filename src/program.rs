@@ -33,18 +33,21 @@ pub const K_PUSH: u8 = 16;
 pub const K_INFO: u8 = 17;
 /// Stream only: run header of plain (bit-unconditioned) CX ops; counted as CX.
 pub const K_CXRUN: u8 = 18;
-/// Stream only: run header of "uniform" gates (NEG, Z, X, CZ, CX, CCZ, CCX, with or without a bit condition), each
-/// executed branch-free as `t = base & bits[cb] & q[a] & q[b] & q[c]; q[d] ^= t` with the constant slots below.
-/// Layout: `K_UNIRUN | count << 8`, the number of condition groups, then per group `UNI_GROUP` words (the condition
-/// bit slot and a histogram of the group's ops per `UNI_KINDS` kind, for the counts), then `UNI_ENTRY` words per
-/// entry: `a | b << 16`, `c | d << 16`, the condition bit slot.
+/// Stream only: run header of "uniform" gates (NEG, Z, X, CZ, CX, CCZ, CCX), each executed branch-free as
+/// `t = base & bits[cb] & q[a] & q[b] & q[c]; q[d] ^= t` with the constant slots below. Layout: `K_UNIRUN | count
+/// << 8` (no entry has a bit condition; entries are `UNI_ENTRY_PLAIN` words: `a | b << 16`, `c | d << 16`) or
+/// `K_UNIRUN_IF | count << 8` (entries are `UNI_ENTRY_IF` words: the same plus the condition bit slot); then the
+/// number of count items and `UNI_ITEM` words per item: the condition bit slot and `kind slot | count << 8`, items
+/// of one condition adjacent, so the counts need one popcount per distinct condition and one multiply-add per item.
 pub const K_UNIRUN: u8 = 19;
+pub const K_UNIRUN_IF: u8 = 20;
 /// Number of count slots (kinds 0..=17).
 pub const NCOUNT: usize = 18;
-/// Kinds a uniform run may hold, in histogram order.
+/// Kinds a uniform run may hold, in item-slot order.
 pub const UNI_KINDS: [u8; 7] = [K_NEG, K_Z, K_X, K_CZ, K_CX, K_CCZ, K_CCX];
-pub const UNI_GROUP: usize = 1 + UNI_KINDS.len();
-pub const UNI_ENTRY: usize = 3;
+pub const UNI_ITEM: usize = 2;
+pub const UNI_ENTRY_PLAIN: usize = 2;
+pub const UNI_ENTRY_IF: usize = 3;
 /// Classical-bit array layout of a `Sim`: slot 0 is the constant all-ones bit (the condition of an unconditioned
 /// uniform entry); compact bit `i` lives at slot `i + B_OFF`. Every bit operand in the stream is already offset.
 pub const B_ONES: u32 = 0;
@@ -60,7 +63,7 @@ pub const N_DUMMY: u32 = 8;
 pub const Q_OFF: u32 = Q_DUMMY + N_DUMMY;
 /// Plain CX stretches at least this long are emitted as a `K_CXRUN` (its loop is cheaper than the uniform one);
 /// shorter ones join the surrounding uniform run.
-pub const CX_RUN_MIN: usize = 8;
+pub const CX_RUN_MIN: usize = 2;
 /// Pending uniform-kind ops are flushed when this many accumulate (bounds compile-time memory).
 pub const MAX_PENDING: usize = 1 << 16;
 
@@ -524,8 +527,10 @@ impl Builder {
             return;
         }
         for part in seg.chunks(MAX_RUN) {
-            self.code.push(K_UNIRUN as u32 | ((part.len() as u32) << 8));
-            // Condition groups in order of first appearance: (bit slot, histogram over UNI_KINDS).
+            let has_if = part.iter().any(|e| e.2 != B_ONES);
+            let opc = if has_if { K_UNIRUN_IF } else { K_UNIRUN };
+            self.code.push(opc as u32 | ((part.len() as u32) << 8));
+            // Count items: per condition (order of first appearance) and kind, the number of entries.
             let mut groups: Vec<(u32, [u32; UNI_KINDS.len()])> = Vec::new();
             for &(kind, _, cb) in part {
                 let g = match groups.iter().position(|g| g.0 == cb) {
@@ -537,16 +542,23 @@ impl Builder {
                 };
                 groups[g].1[uni_slot(kind).unwrap()] += 1;
             }
-            self.code.push(groups.len() as u32);
+            let n_items: u32 = groups.iter().map(|g| g.1.iter().filter(|&&c| c != 0).count() as u32).sum();
+            self.code.push(n_items);
             for (cb, hist) in &groups {
-                self.code.push(*cb);
-                self.code.extend_from_slice(hist);
+                for (slot, &c) in hist.iter().enumerate() {
+                    if c != 0 {
+                        self.code.push(*cb);
+                        self.code.push(slot as u32 | (c << 8));
+                    }
+                }
             }
             for &(kind, q, cb) in part {
                 let e = self.uni_entry(kind, &q);
                 self.code.push(e[0] | (e[1] << 16));
                 self.code.push(e[2] | (e[3] << 16));
-                self.code.push(cb);
+                if has_if {
+                    self.code.push(cb);
+                }
             }
             self.n_uni += 1;
         }
@@ -1064,8 +1076,9 @@ impl KmbOps {
 pub const CACHE_MAGIC: &[u8; 8] = b"KMXEPRG\0";
 /// Bump whenever the IR or this layout changes. Format 2 (0.3.0) adds `reaction_depth` as a ninth scalar field.
 /// Format 3 offsets qubit operands by `Q_OFF` and bit operands by `B_OFF`, adds `K_UNIRUN` and `n_uni_runs` as a
-/// tenth scalar field.
-pub const CACHE_FORMAT: u32 = 3;
+/// tenth scalar field. Format 4 splits uniform runs into `K_UNIRUN` (two-word entries) and `K_UNIRUN_IF`
+/// (three-word entries) with (condition, kind, count) items.
+pub const CACHE_FORMAT: u32 = 4;
 
 /// Streaming 64-bit checksum (4 multiply-rotate lanes over 8-byte words; independent of how the bytes are split
 /// into calls). Detects truncation and corruption; it is not a cryptographic hash.
@@ -1289,6 +1302,39 @@ impl Program {
         Ok(p)
     }
 
+    /// [cx_runs, cx_entries, uni_runs, uni_groups, uni_entries, uni_if_entries, interpreter ops] of the stream.
+    pub fn stream_stats(&self) -> [u64; 7] {
+        let mut s = [0u64; 7];
+        let c = &self.code;
+        let mut i = 0usize;
+        while i < c.len() {
+            let w0 = c[i];
+            let op = (w0 & 0xFF) as u8;
+            if op == K_CXRUN {
+                let n = (w0 >> 8) as usize;
+                s[0] += 1;
+                s[1] += n as u64;
+                i += 1 + n;
+            } else if op == K_UNIRUN || op == K_UNIRUN_IF {
+                let n = (w0 >> 8) as usize;
+                let ni = c[i + 1] as usize;
+                let hdr = 2 + UNI_ITEM * ni;
+                let ew = if op == K_UNIRUN_IF { UNI_ENTRY_IF } else { UNI_ENTRY_PLAIN };
+                s[2] += 1;
+                s[3] += ni as u64;
+                s[4] += n as u64;
+                if op == K_UNIRUN_IF {
+                    s[5] += n as u64;
+                }
+                i += hdr + ew * n;
+            } else {
+                s[6] += 1;
+                i += OP_LEN[op as usize] as usize;
+            }
+        }
+        s
+    }
+
     /// Walk the stream and check every operand is in range (the interpreter uses unchecked indexing).
     pub fn validate(&self) -> Result<(), String> {
         let lens = op_len_table();
@@ -1320,35 +1366,39 @@ impl Program {
                 i += 1 + n;
                 continue;
             }
-            if op == K_UNIRUN {
+            if op == K_UNIRUN || op == K_UNIRUN_IF {
                 let n = (w0 >> 8) as usize;
                 if i + 2 > c.len() {
                     return Err("cache stream: uniform run overruns".into());
                 }
-                let ng = c[i + 1] as usize;
-                let hdr = 2 + UNI_GROUP * ng;
-                if ng > n.max(1) || i + hdr + UNI_ENTRY * n > c.len() {
+                let ni = c[i + 1] as usize;
+                let hdr = 2 + UNI_ITEM * ni;
+                let ew = if op == K_UNIRUN_IF { UNI_ENTRY_IF } else { UNI_ENTRY_PLAIN };
+                if ni > n.max(1) || i + hdr + ew * n > c.len() {
                     return Err("cache stream: uniform run overruns".into());
                 }
-                let mut hist = 0u64;
-                for g in c[i + 2..i + hdr].chunks_exact(UNI_GROUP) {
-                    if !bok(g[0]) {
-                        return Err("cache stream: uniform group condition bit out of range".into());
+                let mut total = 0u64;
+                for it in c[i + 2..i + hdr].chunks_exact(UNI_ITEM) {
+                    if !bok(it[0]) || (it[1] & 0xFF) as usize >= UNI_KINDS.len() {
+                        return Err("cache stream: uniform count item out of range".into());
                     }
-                    hist += g[1..].iter().map(|&h| h as u64).sum::<u64>();
+                    if op == K_UNIRUN && it[0] != B_ONES {
+                        return Err("cache stream: conditioned count item in a plain uniform run".into());
+                    }
+                    total += (it[1] >> 8) as u64;
                 }
-                if hist != n as u64 {
-                    return Err("cache stream: uniform run histogram does not match its length".into());
+                if total != n as u64 {
+                    return Err("cache stream: uniform run counts do not match its length".into());
                 }
-                for e in c[i + hdr..i + hdr + UNI_ENTRY * n].chunks_exact(UNI_ENTRY) {
+                for e in c[i + hdr..i + hdr + ew * n].chunks_exact(ew) {
                     let (a, b, cc, d) = (e[0] & 0xFFFF, e[0] >> 16, e[1] & 0xFFFF, e[1] >> 16);
                     let src_ok = |q: u32| q == Q_ONES || qok(q);
                     let sink = d >= Q_DUMMY && d < Q_DUMMY + N_DUMMY;
-                    if !src_ok(a) || !src_ok(b) || !src_ok(cc) || !(sink || qok(d)) || !bok(e[2]) {
+                    if !src_ok(a) || !src_ok(b) || !src_ok(cc) || !(sink || qok(d)) || (ew == UNI_ENTRY_IF && !bok(e[2])) {
                         return Err("cache stream: uniform entry out of range".into());
                     }
                 }
-                i += hdr + UNI_ENTRY * n;
+                i += hdr + ew * n;
                 continue;
             }
             let len = lens[op as usize] as usize;

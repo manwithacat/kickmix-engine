@@ -245,6 +245,26 @@ impl<const L: usize> SimG<L> {
         Ok(out)
     }
 
+    /// `phase_flipped` over the shots set in `lanes` only (the others are unspecified; for partial sims in lockstep).
+    pub fn phase_flipped_lanes(&self, has_angles: bool, lanes: Wn<L>) -> Result<Wn<L>, String> {
+        if !has_angles {
+            return Ok(self.phase);
+        }
+        let mut out = Wn::<L>::ZERO;
+        for s in 0..64 * L {
+            if (lanes.0[s / 64] >> (s % 64)) & 1 == 0 {
+                continue;
+            }
+            let ph = (self.phase.0[s / 64] >> (s % 64)) & 1;
+            let v = self.angles[s] ^ ((ph as u128) << 127);
+            if v << 1 != 0 {
+                return Err("phase angles other than 0 and a half turn are present".into());
+            }
+            out.0[s / 64] |= ((v >> 127) as u64) << (s % 64);
+        }
+        Ok(out)
+    }
+
     /// Run the program on this sim with the process's kernel (see `kernel`): the same body compiled for baseline
     /// x86-64, AVX2 (x86-64-v3) or AVX-512 (x86-64-v4); on aarch64 the single (NEON) build.
     pub fn run<const COUNT: bool>(&mut self, prog: &Program) {
@@ -306,13 +326,18 @@ impl<const L: usize> SimG<L> {
         let mut base = Wn::<L>::ONES;
         let mut full = true;
         let mut i = 0usize;
-        // Shots counted for a fully executed op, per sim.
-        let nl = if MASK { lanes.popcnt_sim(0) } else { 256 };
+        // Shots counted for a fully executed op, per sim (a partial last sim counts only its lanes).
+        let mut nls = [256u64; 8];
+        if MASK {
+            for s in 0..ns {
+                nls[s] = lanes.popcnt_sim(s);
+            }
+        }
         if COUNT {
             // INFO_TAG: counted with an all-ones mask on every execution, no other effect.
             for s in 0..ns {
                 if MASK {
-                    counts[s].part[K_INFO as usize] += prog.n_info_tags * nl;
+                    counts[s].part[K_INFO as usize] += prog.n_info_tags * nls[s];
                 } else {
                     counts[s].full[K_INFO as usize] += prog.n_info_tags;
                 }
@@ -342,57 +367,69 @@ impl<const L: usize> SimG<L> {
             while i < n {
                 let w0 = *code.add(i);
                 let opc = (w0 & 0xFF) as u8;
-                if opc == K_UNIRUN {
-                    // Branch-free run of NEG/Z/X/CZ/CX/CCZ/CCX, bit-conditioned or not:
+                if opc == K_UNIRUN || opc == K_UNIRUN_IF {
+                    // Branch-free run of NEG/Z/X/CZ/CX/CCZ/CCX, bit-conditioned (K_UNIRUN_IF) or not:
                     // `t = base & bits[cb] & q[a] & q[b] & q[c]; q[d] ^= t`, absent operands reading the all-ones
-                    // qubit slot and unconditioned entries the all-ones bit slot; a phase entry's `d` is a sink slot,
-                    // which also selects (without a branch) the XOR of `t` into the register-resident phase. Counts:
-                    // one popcount per condition group (entries sharing a condition bit) times its static histogram,
-                    // which equals the per-op `cond.popcnt()` of the ordinary path.
+                    // qubit slot; a phase entry's `d` is a sink slot, which also selects (without a branch) the XOR
+                    // of `t` into the register-resident phase. Counts: per (condition, kind, count) item, the
+                    // condition's shot count (one popcount per distinct condition) times the count, which equals
+                    // the per-op `cond.popcnt()` of the ordinary path.
                     let cnt = (w0 >> 8) as usize;
-                    let ngroups = *code.add(i + 1) as usize;
-                    let groups = code.add(i + 2);
-                    let ent = code.add(i + 2 + UNI_GROUP * ngroups);
-                    i += 2 + UNI_GROUP * ngroups + UNI_ENTRY * cnt;
+                    let nitems = *code.add(i + 1) as usize;
+                    let items = code.add(i + 2);
+                    let ent = code.add(i + 2 + UNI_ITEM * nitems);
+                    let ew = if opc == K_UNIRUN_IF { UNI_ENTRY_IF } else { UNI_ENTRY_PLAIN };
+                    i += 2 + UNI_ITEM * nitems + ew * cnt;
                     if COUNT {
-                        for g in 0..ngroups {
-                            let gw = groups.add(UNI_GROUP * g);
-                            let cb = *gw as usize;
-                            let hist = gw.add(1);
-                            if MASK {
-                                let c = base & *bp.add(cb) & lanes;
-                                for s in 0..ns {
-                                    let m = c.popcnt_sim(s);
-                                    for k in 0..UNI_KINDS.len() {
-                                        counts[s].part[UNI_KINDS[k] as usize] += *hist.add(k) as u64 * m;
+                        let mut last_cb = usize::MAX;
+                        let mut m = [0u64; 8];
+                        let mut plain_full = false;
+                        for it in 0..nitems {
+                            let cb = *items.add(UNI_ITEM * it) as usize;
+                            let w = *items.add(UNI_ITEM * it + 1);
+                            let (k, n) = (UNI_KINDS[(w & 0xFF) as usize] as usize, (w >> 8) as u64);
+                            if cb != last_cb {
+                                last_cb = cb;
+                                plain_full = full && cb == B_ONES as usize && !MASK;
+                                if !plain_full {
+                                    let c = if MASK { base & *bp.add(cb) & lanes } else { base & *bp.add(cb) };
+                                    for s in 0..ns {
+                                        m[s] = c.popcnt_sim(s);
                                     }
                                 }
-                            } else if full && cb == B_ONES as usize {
+                            }
+                            if plain_full {
                                 for s in 0..ns {
-                                    for k in 0..UNI_KINDS.len() {
-                                        counts[s].full[UNI_KINDS[k] as usize] += *hist.add(k) as u64;
-                                    }
+                                    counts[s].full[k] += n;
                                 }
                             } else {
-                                let c = base & *bp.add(cb);
                                 for s in 0..ns {
-                                    let m = c.popcnt_sim(s);
-                                    for k in 0..UNI_KINDS.len() {
-                                        counts[s].part[UNI_KINDS[k] as usize] += *hist.add(k) as u64 * m;
-                                    }
+                                    counts[s].part[k] += n * m[s];
                                 }
                             }
                         }
                     }
-                    for j in 0..cnt {
-                        let e0 = *ent.add(UNI_ENTRY * j);
-                        let e1 = *ent.add(UNI_ENTRY * j + 1);
-                        let cb = *ent.add(UNI_ENTRY * j + 2) as usize;
-                        let d = (e1 >> 16) as usize;
-                        let t = base & *bp.add(cb) & *qp.add((e0 & 0xFFFF) as usize) & *qp.add((e0 >> 16) as usize) & *qp.add((e1 & 0xFFFF) as usize);
-                        let pm = Wn::<L>::splat(((d.wrapping_sub(Q_DUMMY as usize) < N_DUMMY as usize) as u64).wrapping_neg());
-                        phase ^= t & pm;
-                        *qp.add(d) ^= t;
+                    if opc == K_UNIRUN_IF {
+                        for j in 0..cnt {
+                            let e0 = *ent.add(UNI_ENTRY_IF * j);
+                            let e1 = *ent.add(UNI_ENTRY_IF * j + 1);
+                            let cb = *ent.add(UNI_ENTRY_IF * j + 2) as usize;
+                            let d = (e1 >> 16) as usize;
+                            let t = base & *bp.add(cb) & *qp.add((e0 & 0xFFFF) as usize) & *qp.add((e0 >> 16) as usize) & *qp.add((e1 & 0xFFFF) as usize);
+                            let pm = Wn::<L>::splat(((d.wrapping_sub(Q_DUMMY as usize) < N_DUMMY as usize) as u64).wrapping_neg());
+                            phase ^= t & pm;
+                            *qp.add(d) ^= t;
+                        }
+                    } else {
+                        for j in 0..cnt {
+                            let e0 = *ent.add(UNI_ENTRY_PLAIN * j);
+                            let e1 = *ent.add(UNI_ENTRY_PLAIN * j + 1);
+                            let d = (e1 >> 16) as usize;
+                            let t = base & *qp.add((e0 & 0xFFFF) as usize) & *qp.add((e0 >> 16) as usize) & *qp.add((e1 & 0xFFFF) as usize);
+                            let pm = Wn::<L>::splat(((d.wrapping_sub(Q_DUMMY as usize) < N_DUMMY as usize) as u64).wrapping_neg());
+                            phase ^= t & pm;
+                            *qp.add(d) ^= t;
+                        }
                     }
                     continue;
                 }
@@ -409,7 +446,7 @@ impl<const L: usize> SimG<L> {
                         if COUNT {
                             for s in 0..ns {
                                 if MASK {
-                                    counts[s].part[K_CX as usize] += cnt as u64 * nl;
+                                    counts[s].part[K_CX as usize] += cnt as u64 * nls[s];
                                 } else {
                                     counts[s].full[K_CX as usize] += cnt as u64;
                                 }
@@ -506,7 +543,7 @@ impl<const L: usize> SimG<L> {
                             if MASK {
                                 let c = cond & lanes;
                                 for s in 0..ns {
-                                    counts[s].zpart[lv] += if cfull { nl } else { c.popcnt_sim(s) };
+                                    counts[s].zpart[lv] += if cfull { nls[s] } else { c.popcnt_sim(s) };
                                 }
                             } else if cfull {
                                 for s in 0..ns {
@@ -559,7 +596,7 @@ impl<const L: usize> SimG<L> {
                     if MASK {
                         if cfull {
                             for s in 0..ns {
-                                counts[s].part[k] += nl;
+                                counts[s].part[k] += nls[s];
                             }
                         } else {
                             count_part!(k, cond & lanes);

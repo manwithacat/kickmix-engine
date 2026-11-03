@@ -410,6 +410,8 @@ pub struct BatchSpec<'a> {
     pub counting: bool,
     pub dump: bool,
     pub threads: usize,
+    /// Simulate batches in lockstep pairs (same results as singles).
+    pub lockstep: bool,
 }
 
 pub struct BatchOut {
@@ -437,90 +439,197 @@ pub fn run_batches(spec: &BatchSpec) -> Result<BatchOut, String> {
     if spec.qin.len() != nb * nqi * 4 || spec.bin.len() != nb * nbi * 4 {
         return Err("input array sizes do not match ids x batches x 4".into());
     }
-    let nq = p.num_qubits;
-    let mut is_in = vec![false; nq];
-    for &q in spec.qin_ids {
-        let q = q as usize;
-        if q >= nq || is_in[q] {
-            return Err("input qubit id out of range or repeated".into());
-        }
-        is_in[q] = true;
-    }
-    if spec.bin_ids.iter().any(|&b| b as usize >= p.num_bits) {
-        return Err("input bit id out of range (must be compact ids)".into());
-    }
-    let others: Vec<usize> = (0..nq).filter(|&i| !is_in[i]).collect();
+    let others = input_check(p, spec.qin_ids, spec.bin_ids)?;
     let has_angles = !p.angles.is_empty();
+    let nq = p.num_qubits;
     let ncb = p.num_bits.max(1);
-
-    let mut val_err = vec![0u64; nb * 4];
-    let mut phase = vec![0u64; nb * 4];
-    let mut units = vec![0u64; nb * 256];
-    let mut kind_counts = vec![0u64; nb * NCOUNT];
-    let mut z_levels = vec![0u64; nb * 129];
-    let (mut dump_q, mut dump_bits) = (Vec::new(), Vec::new());
-    if spec.dump {
-        dump_q = vec![0u64; nb * nq * 4];
-        dump_bits = vec![0u64; nb * ncb * 4];
-    }
-    let (pv, pp, pk, pz) = (SP(val_err.as_mut_ptr()), SP(phase.as_mut_ptr()), SP(kind_counts.as_mut_ptr()), SP(z_levels.as_mut_ptr()));
-    let pu = SP(units.as_mut_ptr());
-    let (pdq, pdb) = (SP(dump_q.as_mut_ptr()), SP(dump_bits.as_mut_ptr()));
+    let mut out = BatchOut {
+        val_err: vec![0u64; nb * 4],
+        phase: vec![0u64; nb * 4],
+        units: vec![0u64; nb * 256],
+        kind_counts: vec![0u64; nb * NCOUNT],
+        z_levels: vec![0u64; nb * 129],
+        dump_q: if spec.dump { vec![0u64; nb * nq * 4] } else { Vec::new() },
+        dump_bits: if spec.dump { vec![0u64; nb * ncb * 4] } else { Vec::new() },
+    };
+    let ptrs = BatchPtrs {
+        pv: SP(out.val_err.as_mut_ptr()),
+        pp: SP(out.phase.as_mut_ptr()),
+        pu: SP(out.units.as_mut_ptr()),
+        pk: SP(out.kind_counts.as_mut_ptr()),
+        pz: SP(out.z_levels.as_mut_ptr()),
+        pdq: SP(out.dump_q.as_mut_ptr()),
+        pdb: SP(out.dump_bits.as_mut_ptr()),
+        pe: SP(std::ptr::null_mut()),
+    };
+    let groups = lockstep_groups(nb, spec.lockstep);
     let errs: Vec<String> = pool(spec.threads).install(|| {
-        (0..nb)
-            .into_par_iter()
+        groups
+            .par_iter()
             .with_max_len(1)
-            .filter_map(|b| {
-                let qin = &spec.qin[b * nqi * 4..(b + 1) * nqi * 4];
-                let bin = &spec.bin[b * nbi * 4..(b + 1) * nbi * 4];
-                let (sim, bad, ph) = match simulate_batch(p, &spec.seeds[b], spec.qin_ids, qin, spec.bin_ids, bin, &others, has_angles, spec.counting) {
-                    Ok(x) => x,
-                    Err(e) => return Some(format!("batch {}: {}", b, e)),
+            .filter_map(|bs| {
+                let qins: Vec<&[u64]> = bs.iter().map(|&b| &spec.qin[b * nqi * 4..(b + 1) * nqi * 4]).collect();
+                let bins: Vec<&[u64]> = bs.iter().map(|&b| &spec.bin[b * nbi * 4..(b + 1) * nbi * 4]).collect();
+                let seeds: Vec<&[u32; 8]> = bs.iter().map(|&b| &spec.seeds[b]).collect();
+                let r = if bs.len() == 2 {
+                    simulate_lockstep::<8>(p, &seeds, spec.qin_ids, &qins, spec.bin_ids, &bins, &others, has_angles, spec.counting)
+                        .map(|(sim, bad, ph)| write_batches(&sim, bs, &bad, &ph, None, nq, ncb, spec.dump, ptrs))
+                } else {
+                    simulate_lockstep::<4>(p, &seeds, spec.qin_ids, &qins, spec.bin_ids, &bins, &others, has_angles, spec.counting)
+                        .map(|(sim, bad, ph)| write_batches(&sim, bs, &bad, &ph, None, nq, ncb, spec.dump, ptrs))
                 };
-                let kc = sim.counts[0].kinds();
-                let zl = sim.counts[0].zlevels();
-                // SAFETY: batch b writes only its own disjoint slices.
-                unsafe {
-                    for w in 0..4 {
-                        *pv.p().add(b * 4 + w) = bad.0[w];
-                        *pp.p().add(b * 4 + w) = ph.0[w];
-                    }
-                    for sh in 0..256 {
-                        let f = (sim.phase.0[sh / 64] >> (sh % 64)) & 1;
-                        let v = sim.angles[sh] ^ ((f as u128) << 127);
-                        *pu.p().add(b * 256 + sh) = (((v >> 63) + 1) >> 1) as u64;
-                    }
-                    for k in 0..NCOUNT {
-                        *pk.p().add(b * NCOUNT + k) = kc[k];
-                    }
-                    for k in 0..129 {
-                        *pz.p().add(b * 129 + k) = zl[k];
-                    }
-                    if spec.dump {
-                        for i in 0..nq {
-                            for w in 0..4 {
-                                *pdq.p().add((b * nq + i) * 4 + w) = sim.qb(i).0[w];
-                            }
-                        }
-                        for i in 0..p.num_bits {
-                            for w in 0..4 {
-                                *pdb.p().add((b * ncb + i) * 4 + w) = sim.bt(i).0[w];
-                            }
-                        }
-                    }
-                }
-                None
+                r.err().map(|e| format!("batch {}: {}", bs[0], e))
             })
             .collect()
     });
     if let Some(e) = errs.into_iter().next() {
         return Err(e);
     }
-    Ok(BatchOut { val_err, phase, units, kind_counts, z_levels, dump_q, dump_bits })
+    Ok(out)
 }
 
-/// One 256-shot batch: kickmix `Simulator(batch_size=256, seed)`, bit-sliced inputs written, circuit run.
-/// Returns the sim, the value-check failures (an input qubit changed or another qubit nonzero) and the phase flips.
+/// Batch indices grouped into lockstep pairs (a trailing single when odd), or singles.
+fn lockstep_groups(nb: usize, lockstep: bool) -> Vec<Vec<usize>> {
+    if !lockstep {
+        return (0..nb).map(|b| vec![b]).collect();
+    }
+    let mut g: Vec<Vec<usize>> = (0..nb / 2).map(|t| vec![2 * t, 2 * t + 1]).collect();
+    if nb % 2 == 1 {
+        g.push(vec![nb - 1]);
+    }
+    g
+}
+
+/// Validates the input ids; returns the qubits that are not inputs (they must end at 0).
+fn input_check(p: &Program, qin_ids: &[u32], bin_ids: &[u32]) -> Result<Vec<usize>, String> {
+    let nq = p.num_qubits;
+    let mut is_in = vec![false; nq];
+    for &q in qin_ids {
+        let q = q as usize;
+        if q >= nq || is_in[q] {
+            return Err("input qubit id out of range or repeated".into());
+        }
+        is_in[q] = true;
+    }
+    if bin_ids.iter().any(|&b| b as usize >= p.num_bits) {
+        return Err("input bit id out of range (must be compact ids)".into());
+    }
+    Ok((0..nq).filter(|&i| !is_in[i]).collect())
+}
+
+#[derive(Clone, Copy)]
+struct BatchPtrs {
+    pv: SP<u64>,
+    pp: SP<u64>,
+    pu: SP<u64>,
+    pk: SP<u64>,
+    pz: SP<u64>,
+    pdq: SP<u64>,
+    pdb: SP<u64>,
+    /// run_dqi only: expected phase flips.
+    pe: SP<u64>,
+}
+
+/// Write the per-batch outputs of a finished lockstep sim: sim `si` is batch `bs[si]`.
+/// SAFETY: every batch index writes only its own disjoint slices; `pu`/`pdq`/`pdb`/`pe` may be null when unused.
+#[allow(clippy::too_many_arguments)]
+fn write_batches<const L: usize>(sim: &SimG<L>, bs: &[usize], bad: &[W], ph: &[W], expected: Option<&[&[u64]]>, nq: usize, ncb: usize, dump: bool, p: BatchPtrs) {
+    for (si, &b) in bs.iter().enumerate() {
+        let kc = sim.counts[si].kinds();
+        let zl = sim.counts[si].zlevels();
+        unsafe {
+            for w in 0..4 {
+                *p.pv.p().add(b * 4 + w) = bad[si].0[w];
+                *p.pp.p().add(b * 4 + w) = ph[si].0[w];
+                if let Some(e) = expected {
+                    *p.pe.p().add(b * 4 + w) = e[si][w];
+                }
+            }
+            if !p.pu.p().is_null() {
+                for sh in 0..256 {
+                    let f = (sim.phase.0[4 * si + sh / 64] >> (sh % 64)) & 1;
+                    let v = sim.angles[256 * si + sh] ^ ((f as u128) << 127);
+                    *p.pu.p().add(b * 256 + sh) = (((v >> 63) + 1) >> 1) as u64;
+                }
+            }
+            for k in 0..NCOUNT {
+                *p.pk.p().add(b * NCOUNT + k) = kc[k];
+            }
+            for k in 0..129 {
+                *p.pz.p().add(b * 129 + k) = zl[k];
+            }
+            if dump {
+                for i in 0..nq {
+                    for w in 0..4 {
+                        *p.pdq.p().add((b * nq + i) * 4 + w) = sim.qb(i).0[4 * si + w];
+                    }
+                }
+                for i in 0..sim.num_bits() {
+                    for w in 0..4 {
+                        *p.pdb.p().add((b * ncb + i) * 4 + w) = sim.bt(i).0[4 * si + w];
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// `L / 4` independent 256-shot batches on one lockstep sim: each is kickmix `Simulator(batch_size=256, seed)`
+/// with its bit-sliced inputs written, the circuit run once for all. Returns the sim, per batch the value-check
+/// failures (an input qubit changed or another qubit nonzero) and the phase flips.
+#[allow(clippy::too_many_arguments)]
+pub fn simulate_lockstep<'p, const L: usize>(
+    p: &'p Program,
+    seeds: &[&[u32; 8]],
+    qin_ids: &[u32],
+    qins: &[&[u64]],
+    bin_ids: &[u32],
+    bins: &[&[u64]],
+    others: &[usize],
+    has_angles: bool,
+    counting: bool,
+) -> Result<(SimG<L>, Vec<W>, Vec<W>), String> {
+    let ns = L / 4;
+    debug_assert!(seeds.len() == ns && qins.len() == ns && bins.len() == ns);
+    let keys: Vec<_> = seeds
+        .iter()
+        .map(|sd| {
+            let mut master = Mt64::from_seed_seq(*sd);
+            keys_from_sim_seed(&sim_seed_words(&mut master))
+        })
+        .collect();
+    let mut sim = SimG::<L>::new_lockstep(p, keys);
+    for s in 0..ns {
+        for (j, &q) in qin_ids.iter().enumerate() {
+            sim.qb_mut(q as usize).0[4 * s..4 * s + 4].copy_from_slice(&qins[s][4 * j..4 * j + 4]);
+        }
+        for (j, &c) in bin_ids.iter().enumerate() {
+            sim.bt_mut(c as usize).0[4 * s..4 * s + 4].copy_from_slice(&bins[s][4 * j..4 * j + 4]);
+        }
+    }
+    if counting {
+        sim.run::<true>(p);
+    } else {
+        sim.run::<false>(p);
+    }
+    let phl = sim.phase_flipped(has_angles)?;
+    let mut bad = vec![W::ZERO; ns];
+    let mut ph = vec![W::ZERO; ns];
+    for s in 0..ns {
+        let mut bd = W::ZERO;
+        for (j, &q) in qin_ids.iter().enumerate() {
+            bd = bd | (sim.qb(q as usize).sim(s) ^ Wn([qins[s][4 * j], qins[s][4 * j + 1], qins[s][4 * j + 2], qins[s][4 * j + 3]]));
+        }
+        for &i in others {
+            bd = bd | sim.qb(i).sim(s);
+        }
+        bad[s] = bd;
+        ph[s] = phl.sim(s);
+    }
+    Ok((sim, bad, ph))
+}
+
+/// One 256-shot batch (the single-sim form of `simulate_lockstep`).
 #[allow(clippy::too_many_arguments)]
 pub fn simulate_batch<'p>(
     p: &'p Program,
@@ -533,29 +642,8 @@ pub fn simulate_batch<'p>(
     has_angles: bool,
     counting: bool,
 ) -> Result<(Sim, W, W), String> {
-    let mut master = Mt64::from_seed_seq(seed);
-    let keys = keys_from_sim_seed(&sim_seed_words(&mut master));
-    let mut sim = Sim::new(p, keys);
-    for (j, &q) in qin_ids.iter().enumerate() {
-        *sim.qb_mut(q as usize) = Wn([qin[4 * j], qin[4 * j + 1], qin[4 * j + 2], qin[4 * j + 3]]);
-    }
-    for (j, &c) in bin_ids.iter().enumerate() {
-        *sim.bt_mut(c as usize) = Wn([bin[4 * j], bin[4 * j + 1], bin[4 * j + 2], bin[4 * j + 3]]);
-    }
-    if counting {
-        sim.run::<true>(p);
-    } else {
-        sim.run::<false>(p);
-    }
-    let mut bad = W::ZERO;
-    for (j, &q) in qin_ids.iter().enumerate() {
-        bad = bad | (sim.qb(q as usize) ^ Wn([qin[4 * j], qin[4 * j + 1], qin[4 * j + 2], qin[4 * j + 3]]));
-    }
-    for &i in others {
-        bad = bad | sim.qb(i);
-    }
-    let ph = sim.phase_flipped(has_angles)?;
-    Ok((sim, bad, ph))
+    let (sim, bad, ph) = simulate_lockstep::<4>(p, &[seed], qin_ids, &[qin], bin_ids, &[bin], others, has_angles, counting)?;
+    Ok((sim, bad[0], ph[0]))
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -577,6 +665,7 @@ pub struct DqiSpec<'a> {
     pub bin_ids: &'a [u32],
     pub counting: bool,
     pub threads: usize,
+    pub lockstep: bool,
 }
 
 pub struct DqiOut {
@@ -603,62 +692,58 @@ pub fn run_dqi(spec: &DqiSpec) -> Result<DqiOut, String> {
     if spec.qin_ids.len() != spec.sampler.n * spec.sampler.degree || spec.bin_ids.len() != spec.sampler.e_rows.len() {
         return Err("qin_ids / bin_ids do not match the sampler rows".into());
     }
-    let nq = p.num_qubits;
-    let mut is_in = vec![false; nq];
-    for &q in spec.qin_ids {
-        let q = q as usize;
-        if q >= nq || is_in[q] {
-            return Err("input qubit id out of range or repeated".into());
-        }
-        is_in[q] = true;
-    }
-    if spec.bin_ids.iter().any(|&b| b as usize >= p.num_bits) {
-        return Err("input bit id out of range (must be compact ids)".into());
-    }
-    let others: Vec<usize> = (0..nq).filter(|&i| !is_in[i]).collect();
+    let others = input_check(p, spec.qin_ids, spec.bin_ids)?;
     let has_angles = !p.angles.is_empty();
-    let mut val_err = vec![0u64; nb * 4];
-    let mut phase = vec![0u64; nb * 4];
-    let mut expected = vec![0u64; nb * 4];
-    let mut kind_counts = vec![0u64; nb * NCOUNT];
-    let mut z_levels = vec![0u64; nb * 129];
-    let (pv, pp, pe, pk, pz) =
-        (SP(val_err.as_mut_ptr()), SP(phase.as_mut_ptr()), SP(expected.as_mut_ptr()), SP(kind_counts.as_mut_ptr()), SP(z_levels.as_mut_ptr()));
+    let nq = p.num_qubits;
+    let mut out = DqiOut {
+        val_err: vec![0u64; nb * 4],
+        phase: vec![0u64; nb * 4],
+        expected: vec![0u64; nb * 4],
+        kind_counts: vec![0u64; nb * NCOUNT],
+        z_levels: vec![0u64; nb * 129],
+    };
+    let ptrs = BatchPtrs {
+        pv: SP(out.val_err.as_mut_ptr()),
+        pp: SP(out.phase.as_mut_ptr()),
+        pu: SP(std::ptr::null_mut()),
+        pk: SP(out.kind_counts.as_mut_ptr()),
+        pz: SP(out.z_levels.as_mut_ptr()),
+        pdq: SP(std::ptr::null_mut()),
+        pdb: SP(std::ptr::null_mut()),
+        pe: SP(out.expected.as_mut_ptr()),
+    };
+    let groups = lockstep_groups(nb, spec.lockstep);
     let errs: Vec<String> = pool(spec.threads).install(|| {
-        (0..nb)
-            .into_par_iter()
+        groups
+            .par_iter()
             .with_max_len(1)
-            .filter_map(|b| {
-                let mut rng = spec.pcg[b].clone();
-                let smp = spec.sampler.sample(&mut rng, false);
-                let (sim, bad, ph) = match simulate_batch(p, &spec.seeds[b], spec.qin_ids, &smp.qin, spec.bin_ids, &smp.bin, &others, has_angles, spec.counting) {
-                    Ok(x) => x,
-                    Err(e) => return Some(format!("batch {}: {}", b, e)),
+            .filter_map(|bs| {
+                let smps: Vec<_> = bs
+                    .iter()
+                    .map(|&b| {
+                        let mut rng = spec.pcg[b].clone();
+                        spec.sampler.sample(&mut rng, false)
+                    })
+                    .collect();
+                let qins: Vec<&[u64]> = smps.iter().map(|s| s.qin.as_slice()).collect();
+                let bins: Vec<&[u64]> = smps.iter().map(|s| s.bin.as_slice()).collect();
+                let exps: Vec<&[u64]> = smps.iter().map(|s| s.phase.as_slice()).collect();
+                let seeds: Vec<&[u32; 8]> = bs.iter().map(|&b| &spec.seeds[b]).collect();
+                let r = if bs.len() == 2 {
+                    simulate_lockstep::<8>(p, &seeds, spec.qin_ids, &qins, spec.bin_ids, &bins, &others, has_angles, spec.counting)
+                        .map(|(sim, bad, ph)| write_batches(&sim, bs, &bad, &ph, Some(&exps), nq, 1, false, ptrs))
+                } else {
+                    simulate_lockstep::<4>(p, &seeds, spec.qin_ids, &qins, spec.bin_ids, &bins, &others, has_angles, spec.counting)
+                        .map(|(sim, bad, ph)| write_batches(&sim, bs, &bad, &ph, Some(&exps), nq, 1, false, ptrs))
                 };
-                let kc = sim.counts[0].kinds();
-                let zl = sim.counts[0].zlevels();
-                // SAFETY: batch b writes only its own disjoint slices.
-                unsafe {
-                    for w in 0..4 {
-                        *pv.p().add(b * 4 + w) = bad.0[w];
-                        *pp.p().add(b * 4 + w) = ph.0[w];
-                        *pe.p().add(b * 4 + w) = smp.phase[w];
-                    }
-                    for k in 0..NCOUNT {
-                        *pk.p().add(b * NCOUNT + k) = kc[k];
-                    }
-                    for k in 0..129 {
-                        *pz.p().add(b * 129 + k) = zl[k];
-                    }
-                }
-                None
+                r.err().map(|e| format!("batch {}: {}", bs[0], e))
             })
             .collect()
     });
     if let Some(e) = errs.into_iter().next() {
         return Err(e);
     }
-    Ok(DqiOut { val_err, phase, expected, kind_counts, z_levels })
+    Ok(out)
 }
 
 pub struct SampleOut {
@@ -718,6 +803,8 @@ pub struct SeqSpec<'a> {
     /// Also return the whole state after every step (for parity tests).
     pub dump: bool,
     pub threads: usize,
+    /// Simulate the 256-shot sims in lockstep pairs (same results as singles).
+    pub lockstep: bool,
 }
 
 pub struct SeqOut {
@@ -788,102 +875,20 @@ pub fn run_sequence(spec: &SeqSpec) -> Result<SeqOut, String> {
     let mut master = Mt64::from_seed_seq(spec.seed);
     let sim_seeds: Vec<[u32; 8]> = (0..nsims).map(|_| sim_seed_words(&mut master)).collect();
 
-    let res: Vec<Result<StepCounts, String>> = pool(spec.threads).install(|| {
-        (0..nsims)
-            .into_par_iter()
+    let groups = lockstep_groups(nsims, spec.lockstep);
+    let ctx = SeqCtx { nq, nb, depth, xw, nsims, scratch: &scratch, has_angles: &has_angles, sim_seeds: &sim_seeds, px, pd, pp, pdq, pdb };
+    let res: Vec<Result<Vec<StepCounts>, String>> = pool(spec.threads).install(|| {
+        groups
+            .par_iter()
             .with_max_len(1)
-            .map(|u| {
-                let base = u * 256;
-                let nl = (shots - base).min(256);
-                let mut lanes = W::ZERO;
-                for s in 0..nl {
-                    lanes.0[s / 64] |= 1u64 << (s % 64);
-                }
-                let partial = nl < 256;
-                let mut sim = Sim::with_dims(nq, nb, depth, keys_from_sim_seed(&sim_seeds[u]));
-                // Inputs: transpose 64 shots x 64 register bits at a time.
-                let mut rows = [0u64; 64];
-                for w in 0..4 {
-                    for xb in 0..xw {
-                        for r in 0..64 {
-                            let s = base + 64 * w + r;
-                            rows[r] = if s < shots { spec.x0[s * xw + xb] } else { 0 };
-                        }
-                        transpose64(&mut rows);
-                        for i in 0..(width - 64 * xb).min(64) {
-                            sim.qb_mut(spec.xreg[64 * xb + i] as usize).0[w] = rows[i];
-                        }
-                    }
-                }
-                let mut kc = Vec::with_capacity(ns);
-                let mut zl = Vec::with_capacity(ns);
-                let mut keep = vec![W::ZERO; width];
-                for (st, prog) in spec.progs.iter().enumerate() {
-                    if st > 0 {
-                        // The verifier's reset: clear_for_shot (the RNG stream continues), then the public registers
-                        // are written back for the real shots only.
-                        for (i, &q) in spec.xreg.iter().enumerate() {
-                            keep[i] = sim.qb(q as usize) & lanes;
-                        }
-                        sim.clear_for_shot();
-                        for (i, &q) in spec.xreg.iter().enumerate() {
-                            *sim.qb_mut(q as usize) = keep[i];
-                        }
-                    }
-                    match (spec.counting, partial) {
-                        (true, false) => sim.run::<true>(prog),
-                        (true, true) => sim.run_lanes::<true>(prog, lanes),
-                        (false, _) => sim.run::<false>(prog),
-                    }
-                    let ph = sim.phase_flipped_first(has_angles[st], nl).map_err(|e| format!("step {}: {}", st, e))?;
-                    let mut dw = W::ZERO;
-                    for &i in &scratch[st] {
-                        dw = dw | sim.qb(i);
-                    }
-                    // SAFETY: sim u writes only shots base..base+nl of each step.
-                    unsafe {
-                        for w in 0..4 {
-                            for xb in 0..xw {
-                                rows = [0u64; 64];
-                                for i in 0..(width - 64 * xb).min(64) {
-                                    rows[i] = sim.qb(spec.xreg[64 * xb + i] as usize).0[w];
-                                }
-                                transpose64(&mut rows);
-                                for r in 0..64 {
-                                    let s = base + 64 * w + r;
-                                    if s < shots {
-                                        *px.p().add((st * shots + s) * xw + xb) = rows[r];
-                                    }
-                                }
-                            }
-                        }
-                        for l in 0..nl {
-                            let s = base + l;
-                            *pd.p().add(st * shots + s) = ((dw.0[l / 64] >> (l % 64)) & 1) as u8;
-                            *pp.p().add(st * shots + s) = ((ph.0[l / 64] >> (l % 64)) & 1) as u8;
-                        }
-                        if spec.dump {
-                            let ub = st * nsims + u;
-                            for i in 0..nq {
-                                for w in 0..4 {
-                                    *pdq.p().add((ub * nq + i) * 4 + w) = sim.qb(i).0[w];
-                                }
-                            }
-                            for i in 0..nbd.min(sim.num_bits()) {
-                                for w in 0..4 {
-                                    *pdb.p().add((ub * nbd + i) * 4 + w) = sim.bt(i).0[w];
-                                }
-                            }
-                        }
-                    }
-                    kc.push(sim.counts[0].kinds());
-                    zl.push(sim.counts[0].zlevels());
-                    sim.counts[0] = Counts::new();
-                }
-                Ok((kc, zl))
-            })
+            .map(|us| if us.len() == 2 { seq_units::<8>(spec, us, &ctx) } else { seq_units::<4>(spec, us, &ctx) })
             .collect()
     });
+    let mut flat: Vec<StepCounts> = Vec::with_capacity(nsims);
+    for r in res {
+        flat.extend(r?);
+    }
+    let res: Vec<Result<StepCounts, String>> = flat.into_iter().map(Ok).collect();
     let mut kind_counts = vec![0u64; ns * NCOUNT];
     let mut z_levels = vec![0u64; ns * 129];
     for r in res {
@@ -898,4 +903,128 @@ pub fn run_sequence(spec: &SeqSpec) -> Result<SeqOut, String> {
         }
     }
     Ok(SeqOut { x_out, dirty, phase, kind_counts, z_levels, dump_q, dump_bits, dump_nq: nq, dump_nb: nbd })
+}
+
+/// Shared read-only context of `seq_units`.
+struct SeqCtx<'a> {
+    nq: usize,
+    nb: usize,
+    depth: usize,
+    xw: usize,
+    nsims: usize,
+    scratch: &'a [Vec<usize>],
+    has_angles: &'a [bool],
+    sim_seeds: &'a [[u32; 8]],
+    px: SP<u64>,
+    pd: SP<u8>,
+    pp: SP<u8>,
+    pdq: SP<u64>,
+    pdb: SP<u64>,
+}
+
+/// `L / 4` sims of the sequence (`units[si]` covers shots 256 u ..) in lockstep through every step; returns the
+/// per-step counts of each unit in `units` order.
+fn seq_units<const L: usize>(spec: &SeqSpec, units: &[usize], c: &SeqCtx) -> Result<Vec<StepCounts>, String> {
+    let nsl = L / 4;
+    debug_assert_eq!(units.len(), nsl);
+    let (shots, width, xw, ns) = (spec.shots, spec.xreg.len(), c.xw, spec.progs.len());
+    let mut lanes = Wn::<L>::ZERO;
+    let mut nl = vec![0usize; nsl];
+    let mut partial = false;
+    for (si, &u) in units.iter().enumerate() {
+        nl[si] = (shots - u * 256).min(256);
+        for s in 0..nl[si] {
+            lanes.0[4 * si + s / 64] |= 1u64 << (s % 64);
+        }
+        partial |= nl[si] < 256;
+    }
+    let keys: Vec<_> = units.iter().map(|&u| keys_from_sim_seed(&c.sim_seeds[u])).collect();
+    let mut sim = SimG::<L>::with_keys(c.nq, c.nb, c.depth, keys);
+    // Inputs: transpose 64 shots x 64 register bits at a time, per sim.
+    let mut rows = [0u64; 64];
+    for (si, &u) in units.iter().enumerate() {
+        let base = u * 256;
+        for w in 0..4 {
+            for xb in 0..xw {
+                for r in 0..64 {
+                    let s = base + 64 * w + r;
+                    rows[r] = if s < shots { spec.x0[s * xw + xb] } else { 0 };
+                }
+                transpose64(&mut rows);
+                for i in 0..(width - 64 * xb).min(64) {
+                    sim.qb_mut(spec.xreg[64 * xb + i] as usize).0[4 * si + w] = rows[i];
+                }
+            }
+        }
+    }
+    let mut kc: Vec<Vec<[u64; NCOUNT]>> = (0..nsl).map(|_| Vec::with_capacity(ns)).collect();
+    let mut zl: Vec<Vec<[u64; 129]>> = (0..nsl).map(|_| Vec::with_capacity(ns)).collect();
+    let mut keep = vec![Wn::<L>::ZERO; width];
+    for (st, prog) in spec.progs.iter().enumerate() {
+        if st > 0 {
+            // The verifier's reset: clear_for_shot (the RNG streams continue), then the public registers are
+            // written back for the real shots only.
+            for (i, &q) in spec.xreg.iter().enumerate() {
+                keep[i] = sim.qb(q as usize) & lanes;
+            }
+            sim.clear_for_shot();
+            for (i, &q) in spec.xreg.iter().enumerate() {
+                *sim.qb_mut(q as usize) = keep[i];
+            }
+        }
+        match (spec.counting, partial) {
+            (true, false) => sim.run::<true>(prog),
+            (true, true) => sim.run_lanes::<true>(prog, lanes),
+            (false, _) => sim.run::<false>(prog),
+        }
+        let ph = sim.phase_flipped_lanes(c.has_angles[st], lanes).map_err(|e| format!("step {}: {}", st, e))?;
+        let mut dw = Wn::<L>::ZERO;
+        for &i in &c.scratch[st] {
+            dw = dw | sim.qb(i);
+        }
+        for (si, &u) in units.iter().enumerate() {
+            let base = u * 256;
+            // SAFETY: sim u writes only shots base..base+nl of each step.
+            unsafe {
+                for w in 0..4 {
+                    for xb in 0..xw {
+                        rows = [0u64; 64];
+                        for i in 0..(width - 64 * xb).min(64) {
+                            rows[i] = sim.qb(spec.xreg[64 * xb + i] as usize).0[4 * si + w];
+                        }
+                        transpose64(&mut rows);
+                        for r in 0..64 {
+                            let s = base + 64 * w + r;
+                            if s < shots {
+                                *c.px.p().add((st * shots + s) * xw + xb) = rows[r];
+                            }
+                        }
+                    }
+                }
+                for l in 0..nl[si] {
+                    let s = base + l;
+                    *c.pd.p().add(st * shots + s) = ((dw.0[4 * si + l / 64] >> (l % 64)) & 1) as u8;
+                    *c.pp.p().add(st * shots + s) = ((ph.0[4 * si + l / 64] >> (l % 64)) & 1) as u8;
+                }
+                if spec.dump {
+                    let ub = st * c.nsims + u;
+                    let nbd = c.nb.max(1);
+                    for i in 0..c.nq {
+                        for w in 0..4 {
+                            *c.pdq.p().add((ub * c.nq + i) * 4 + w) = sim.qb(i).0[4 * si + w];
+                        }
+                    }
+                    for i in 0..nbd.min(sim.num_bits()) {
+                        for w in 0..4 {
+                            *c.pdb.p().add((ub * nbd + i) * 4 + w) = sim.bt(i).0[4 * si + w];
+                        }
+                    }
+                }
+            }
+            kc[si].push(sim.counts[si].kinds());
+            zl[si].push(sim.counts[si].zlevels());
+            sim.counts[si] = Counts::new();
+        }
+    }
+    Ok((0..nsl).map(|si| (std::mem::take(&mut kc[si]), std::mem::take(&mut zl[si]))).collect())
 }
