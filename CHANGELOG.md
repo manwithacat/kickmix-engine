@@ -3,9 +3,27 @@
 All notable changes to kickmix-engine. Dates are UTC. The project was written by an AI model (Claude) under the
 owner's direction; see NOTICE.
 
-## Unreleased (branch `paired-runner`, 2026-11-03)
+## 0.6.0 (2026-11-03)
+
+Circuit comparison becomes a core operation (`diff`, `profile`, a general paired runner and task plug-ins), and the
+workspace gains the `qrom-plan` crate. The simulator is unchanged from 0.5.0 apart from the new `phase_units`
+output, and `verify` results are identical.
 
 ### Added
+- **`crates/qrom-plan`** (workspace member, Rust, no third-party crates; source only, not in the Python wheel:
+  `cargo build --release -p qrom-plan`): a bit-packed GF(2) cost model for the VQCC chemistry `ANGLE_k` five-word
+  QROM loaders. It ports the Python kernel-relation planner (loader build, relation draws, pairing, repair, terms
+  with an exact reconstruction check, `check-plan` for stored plans) and adds an incremental word-flip evaluator
+  (rank-one updates of the loader tensor) with `screen`, `stack` and `batch` commands for word-flip search. 11 unit
+  and 7 integration tests; the real-data parity test runs when `QROM_PLAN_WORDS` and `QROM_PLAN_PLANS` are set.
+  Against the Python planner on an Apple M2 Pro (VQCC card `2026-11-03-chem-fast-qrom-cost-model.md`): pricing one
+  flip incrementally takes 90 µs on 1 thread (about 1,050x), a full re-plan attempt 35-52 ms (22-70x); all 30 stored
+  HW-12/HW-13 plans verify exactly, and 17,202 incremental evaluations equal full recomputation.
+- **`tools/release_check.py`**: one release gate. It builds the wheel and runs, on that artifact, `cargo test
+  --workspace`, a fresh-venv install and CLI smoke test, the pytest suite with and without kickmix, the per-shot
+  parity scripts for all three tasks, `reaction_depth` and FAIL-path parity, `verify --cross-check` for all three
+  tasks, the invsqrt plug-in against the official summary, `diff dqi --profile` against stored predictions and a
+  broken-rewrite test. It prints a PASS/FAIL/SKIP table and exits non-zero on any failure.
 - **`kickmix-engine diff TASK BASE CANDIDATE`** (`kickmix_engine.diff.diff`): compare any two kickmix circuits in
   three layers. (1) *Structural* (`_engine.structural_diff`, Rust, no simulation): op-level alignment in file order
   (common prefix streamed in lockstep, common suffix from 64-bit op hashes, the middle aligned with content-defined
@@ -43,6 +61,16 @@ owner's direction; see NOTICE.
   T count, rotations, eps, worst error/tolerance and worst x) through both the adapter and the profile path.
 - A deliberately broken rewrite (one CX turned into a CZ, Toffoli-neutral) was isolated by the structural layer and
   failed by the semantic layer; the genuine rewrite agreed on every shot.
+
+### Fixed
+- `cargo test --workspace` failed to link on macOS: the engine library has no Rust unit tests, but a test binary
+  built with pyo3's `extension-module` cannot link against libpython. The library target now sets `test = false`
+  and `doctest = false`; the wheel and `build.sh` builds are unchanged.
+
+### Performance
+- Frontier-circuit timings against kickmix 1.0.0 at 1 and 4 threads are in the README (Measured results, 0.6.0).
+  `diff` on a DQI pair takes about 10-14 s at 4 threads (structural layer 4-8 s, paired simulation about 1.5 s for
+  23 batches on each side); the invsqrt per-x tolerance check in the plug-in still runs in NumPy (not yet ported).
 
 ## 0.5.0 (2026-10-28)
 

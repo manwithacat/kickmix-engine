@@ -41,6 +41,10 @@ qrom-plan replan <words.npy> <plan.txt> <pair|structured|block> <seed_from> <see
 qrom-plan flips <words.npy> <plans_dir> <n> <seed> [threads] [examples] [exclude_coded 0|1]   # incremental vs full
 qrom-plan bench <words.npy> <plans_dir> <n> <seed> [threads] [examples] [exclude_coded 0|1]   # incremental only
 qrom-plan replan-flips <words.npy> <plans_dir> <n> <seed> [threads] [trials] [samples] [repair_s] [seeds_per_flip]
+# word-flip search
+qrom-plan screen <words.npy> <plans_dir> <col_from> <col_to_excl> <bits e.g. 1,2,3,4,5,6> <out.tsv> [threads] [loaders]
+qrom-plan stack <words.npy> <plans_dir> <cands.txt> <k> <sub_index> <target_gain> <out_flips.txt>
+qrom-plan batch <words.npy> <plans_dir> <flips.txt> <out_dir> <counts e.g. 109,111,113> <seed_from> <seed_to> [threads] [trials] [samples] [repair_s] [loaders]
 ```
 
 Plans are plain text (`k`, `groups`, `toffolis`, `rel 0x...`, `term a1 h1 a2 h2 s`, optional `count`/`seed`/`per`/

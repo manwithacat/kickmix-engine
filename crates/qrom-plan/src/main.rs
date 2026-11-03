@@ -28,7 +28,7 @@ use qrom_plan::textio::{read_plan, write_plan, Json, PlanFile};
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("usage: qrom-plan <info|check-plan|replan|flips|bench> ...");
+        eprintln!("usage: qrom-plan <info|check-plan|replan|flips|bench|replan-flips|screen|stack|batch> ... (see the header of src/main.rs)");
         std::process::exit(2);
     }
     let r = match args[1].as_str() {

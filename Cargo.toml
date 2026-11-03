@@ -1,6 +1,6 @@
 [package]
 name = "kickmix-engine"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 license = "Apache-2.0"
 description = "Bit-sliced CPU simulator core, per-shot compatible with kickmix"
@@ -10,6 +10,8 @@ readme = "README.md"
 [lib]
 name = "_engine"
 crate-type = ["cdylib", "rlib"]
+test = false     # no Rust unit tests here (the engine is tested from Python); a test binary cannot link
+doctest = false  # against libpython with pyo3 extension-module on macOS
 
 [dependencies]
 pyo3 = { version = "0.26", features = ["abi3-py312", "extension-module"] }

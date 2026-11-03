@@ -68,6 +68,14 @@ kickmix-engine verify dqi circuits/dqi/4ee7a17b4cbc.kmb                    # pri
 kickmix-engine verify dqi circuits/dqi/4ee7a17b4cbc.kmb --salt my-salt --cross-check --official-workers 4
 kickmix-engine verify invsqrt sample_submission/invsqrt.kmb --cross-check
 kickmix-engine verify dfthcsos sample_submission/dfthcsos/ --cross-check    # a directory: angle_k_*.kmb + submission.npz
+
+# Compare two circuits (0.6.0): structural hunks, paired per-shot agreement and the Toffoli change, as JSON
+kickmix-engine diff invsqrt base.kmb candidate.kmb --n 16 --threads 4 --out base-vs-cand.json
+# Profile a base once over 48 fixed draws, then predict any candidate's expected cost from 16 paired batches
+kickmix-engine profile dqi base.kmb --out profiles/ --draws 48 --anchor BASE_SHA256 --salt-format 'sweep-{}'
+kickmix-engine diff dqi base.kmb candidate.kmb --profile profiles/profile-<sha12>.json --n 16
+kickmix-engine diff dfthcsos submission_a/dfthcsos/ submission_b/dfthcsos/              # family level
+kickmix-engine diff generic a.kmb b.kmb --inputs x,y          # any circuit: uniform inputs on named registers
 ```
 
 From Python:
@@ -168,6 +176,24 @@ s = structural("a.kmb", "b.kmb")                                                
 prof = profile(make_plugin("dqi", V), Circuit("base.kmb", make_plugin("dqi", V)), DrawSet(anchor=H, count=48))
 ```
 
+## The `qrom-plan` crate
+
+`crates/qrom-plan` (0.6.0, a workspace member with no third-party crates, built with
+`cargo build --release -p qrom-plan`; not part of the Python wheel) is a bit-packed GF(2) cost model for the VQCC
+chemistry `ANGLE_k` five-word QROM loaders. It ports the project's Python kernel-relation planner (loader build,
+relation draws, pairing, repair, exact plan checking) and adds an incremental evaluator that prices a single word-bit
+flip through a rank-one update of the loader tensor instead of a rebuild, for word-flip searches:
+
+```sh
+qrom-plan check-plan words.npy plans/k4.txt          # exact verification of a stored plan
+qrom-plan screen|stack|batch ...                     # word-flip search (see crates/qrom-plan/README.md)
+```
+
+On an Apple M2 Pro, pricing one flip incrementally takes 90 µs on one thread (about 1,050x the Python planner) and a
+full re-plan attempt 35-52 ms (22-70x); all 30 stored plans of the source project verify exactly, and 17,202
+incremental evaluations equalled full recomputation. Details and the model are in
+[crates/qrom-plan/README.md](crates/qrom-plan/README.md).
+
 ## Chemistry (`dfthcsos`)
 
 The official chemistry verifier spends most of its time outside simulation: on the fork build, 66% of a 7.6 s
@@ -250,6 +276,35 @@ run `verify ... --cross-check` once on a known circuit.
 
 ## Measured results
 
+### 0.6.0: frontier circuits against kickmix 1.0.0 (2026-11-03)
+
+Current frontier circuits, each verified at full official settings with the empty salt: invsqrt `bce2948ff24e`,
+DQI `e3928244a1c1`, and the chemistry family HW-13 (15 `ANGLE_k` circuits). Machine: Apple M2 Pro (6 performance +
+4 efficiency cores), 16 GB, macOS 26.7.2. Baseline: the unmodified official verifier CLIs on kickmix 1.0.0 (PyPI
+wheel) in a clean pyenv Python 3.12.11 venv, at 1 and 4 `--max-workers`. The chemistry verifier has no worker
+option, so it runs single-process. Engine: `kickmix-engine verify` at 1 and 4 threads with a warm program and FCIDUMP
+cache. The simulator code is the same in 0.6.0 as in the measured build, commit 7dcd7b6. Times are the wall clock of
+the whole CLI process; memory is the peak summed RSS of the process tree. Each cell is the median of the runs given
+in brackets. Every one of the 24 runs returned the identical score (invsqrt 100,568.4992; DQI 377,372,994,802.87;
+chemistry 317,777,218.02).
+
+| task | kickmix 1.0.0, 1 worker | engine, 1 thread | speed-up | kickmix 1.0.0, 4 workers | engine, 4 threads | speed-up | peak memory, official / engine (4) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| invsqrt `bce2948ff24e` | 686.0 s (1) | 179.9 s (2) | 3.8x | 173.7 s (2) | 53.1 s (3) | 3.3x | 464-481 / 471-497 MiB |
+| DQI `e3928244a1c1` | 219.9 s (1) | 41.9 s (2) | 5.2x | 83.5 s (2) | 12.8 s (2; first run 14.1 s) | 6.5x | 5,099-5,282 / 429 MiB |
+| chemistry HW-13 | 14.8 s (3; first run 35.0 s) | 2.7 s (2) | 5.5x | (single process) 14.8 s | 1.6 s (2; first run after a cache clear 8.0 s) | 9.3x | 849-852 / 645-937 MiB |
+
+Caveats. This is one machine, and it was **not idle**. Other agents' work, including a 4-core `qrom-plan` job, ran
+throughout, and the 1-minute load average was 6.0-9.2 during the engine runs and 3.4-9.1 during the official runs.
+Each run's load is recorded in its JSON. The official invsqrt rows ran at lower load (3.4-5.1) than the engine
+invsqrt rows (6.4-9.2), so the invsqrt ratios lean conservative for the engine. The rows were not alternated, and the 1-worker
+official invsqrt and DQI rows are single runs. invsqrt gains least because its per-shot checks (x restored, scratch
+clean, phase tolerance per x) still run in NumPy; porting them to Rust is open. The older tables below remain the
+reference for their circuits and dates. Evidence: VQCC project card
+`experiments/2026-11-03-engine-general-paired-runner.md`, `outputs/engine-paired-runner-2026-11-03/benchmarks/`.
+
+### DQI, engine 0.2.0 (measured 2026-10-28)
+
 Full DQI verification of `4ee7a17b4cbc` (889 qubits, 55.8M ops, 102,400 shots, empty salt) on an Apple M2 Pro (6
 performance + 4 efficiency cores). Engine 0.2.0 wheel built by GitHub Actions, against the official verifier CLI on
 kickmix 1.0.0 (PyPI) and on the kickmix-macos 0.3.0 fork, each in a clean Python 3.13 venv. Medians of alternating
@@ -273,7 +328,7 @@ was not re-measured. Version 0.4.0 adds the x86_64 kernels; on Apple Silicon the
 (DQI cross-check 5.7 s cold at 10 threads, as for 0.3.0). invsqrt is less accelerated: about 1.8x the fork at 10 threads on the sample submission
 (31.5 s against 56.2 s, a single smoke run), because its per-shot checks still run in NumPy.
 
-**On Kaggle's CPU notebooks** (2026-10-28, private benchmark notebook, internet off, all three builds installed from
+**On Kaggle's CPU notebooks, engine 0.2.0** (2026-10-28, private benchmark notebook, internet off, all three builds installed from
 wheels): Intel Xeon @ 2.20 GHz (CPU model 79, Broadwell class), 4 vCPUs = 2 cores x 2 threads, AVX2 but no AVX-512,
 31 GiB RAM. Same circuit and salt, engine 0.2.0 (baseline x86-64 build), medians of 2 alternating rounds, memory as the
 process tree's summed PSS (shared pages counted once, so lower than the macOS footprint figures). All 16 runs
@@ -297,7 +352,9 @@ Against kickmix 1.0.0 (first session's figures) that is roughly 8-10x; the fork'
 sessions (87.0 s vs 72.1 s at 4 workers), so treat cross-session ratios as approximate. Kaggle's CPU notebooks have no
 AVX-512, so that kernel's speed is not measured here.
 
-Parity record (all on the circuits named above; the oracle is the unmodified official verifier on kickmix):
+Parity record (0.1.0-0.5.0, 2026-10-27/28, on the circuits named above; the oracle is the unmodified official
+verifier on kickmix). The 0.6.0 release check repeats the per-shot and cross-check parity on the current frontier
+circuits (see Release check below):
 
 | check | result |
 | --- | --- |
@@ -310,6 +367,41 @@ Parity record (all on the circuits named above; the oracle is the unmodified off
 | dfthcsos per-shot parity (0.5.0) | 4 families (3 public frontier submissions and the sample) at 64 shots per address, plus 3 runs with partly used 256-shot simulators (1 and 3 shots per address): every qubit, classical bit, phase flip, register value, workspace flag and per-kind count after each of the 20 or 30 circuit runs equal to the official loop on kickmix; wrong-seed and fresh-simulator-per-step controls mismatch. Repeated under Rosetta 2 with the x86_64 build (baseline and avx2 kernels) against kickmix 1.0.0 from PyPI |
 | dfthcsos task parity (0.5.0) | `--cross-check` on the 4 families x 2 salts (PASS, every field equal) and on 11 mutated families (dirty workspace, changed selection, phase kickback, measurement-dependent word, flipped word bit, broken reverse, Z_POW, missing circuit, other family's factorization, scaled weights over the 20 mHa gates, non-zero padding), at 64 and 1 shots per address: same status and message as the official verifier |
 | FAIL paths | dirty ancilla, syndrome not restored, x not restored, dirty scratch, error-rate and phase-tolerance failures: same status and message as the official verifier |
+
+## Release check
+
+`tools/release_check.py` is the single gate before a release. It builds the wheel with maturin, unpacks it, and runs
+every later check against that artifact (not the source tree), sequentially, with at most `--threads` threads:
+
+```sh
+python tools/release_check.py --out-dir ./rc-0.6.0 \
+    --verifiers /path/to/verifiers --kickmix-python /path/to/venv-with-kickmix/bin/python \
+    --maturin "$(which maturin)" \
+    --invsqrt $C/invsqrt/bce2948ff24e.kmb --dqi $C/dqi/e3928244a1c1.kmb --dfthcsos /path/to/submission/dfthcsos \
+    --rank-json stored-rank-1.json --rank-json stored-rank-2.json \
+    --qrom-words words.npy --qrom-plans plans/ --threads 4
+```
+
+| check | what it does |
+| --- | --- |
+| `versions` | Cargo.toml, Cargo.lock, pyproject.toml and the first CHANGELOG heading carry one version |
+| `cargo-test` | `cargo test --workspace --locked` (qrom-plan's real-data parity too, with `--qrom-words`/`--qrom-plans`) |
+| `wheel-build` | `maturin build --release --locked`; the wheel name must carry the version |
+| `wheel-smoke` | fresh venv (uv, Python 3.12): install the wheel, import, `__version__`, every subcommand's `--help`, `doctor --json`, pytest without kickmix |
+| `pytest-kickmix` | pytest in the kickmix interpreter with the verifiers set (the kickmix-gated tests run) |
+| `parity-invsqrt`, `parity-dqi`, `parity-dfthcsos` | the per-shot parity scripts below on the given circuits, with their negative controls |
+| `reaction-depth` | 300 random circuits plus the invsqrt and DQI circuits against `Circuit.reaction_depth()` |
+| `fail-paths` | the FAIL-path cases through `--cross-check` |
+| `crosscheck-invsqrt`, `crosscheck-dqi`, `crosscheck-dfthcsos` | `verify --cross-check`: every summary field equal to the unmodified official verifier's |
+| `profile-invsqrt` | the invsqrt plug-in's profile at the official seed equals the official summary (score, Toffolis, T, rotations, eps, worst ratio and x, Q) |
+| `diff-dqi-rank` | `diff dqi --profile` reproduces stored predictions (`--rank-json`, e.g. from the VQCC project's `dqi_fast_rank.py`): delta, SE, predicted cost, precondition verdict, every paired Toffoli total |
+| `diff-broken` | `diff invsqrt` of a circuit against itself (agreement 1, delta 0) and against a copy with one CX turned into a CZ (a structural hunk, semantic disagreement and candidate errors) |
+
+It prints one line per check as it goes, then a PASS/FAIL/SKIP table, writes `release-check.json` with the logs and
+reports beside it, and exits 1 if any check failed. A check whose inputs are not given is SKIPped and listed, not
+passed. `--only` and `--skip` take comma lists of check names (`versions` and `wheel-build` always run). The output
+directory must be new. A full run on an Apple M2 Pro at 4 threads takes about 11 minutes with a warm cargo target directory (2026-11-03, 16/16 PASS), most of it the
+official verifier inside the three cross-checks and the FAIL-path cases.
 
 ## Reproduce the parity claims
 
@@ -397,6 +489,12 @@ skipped. The parity scripts below honour the same variable.
   not supported. The chemistry speed-up depends on the FCIDUMP cache: the first run on a machine parses the file
   as the official verifier does. DEBUG_PRINT ops are rejected. Qubit ids must be below 65,536.
 - kickmix must be importable, because the official verifier modules import it.
+- invsqrt's per-shot checks (x restored, scratch clean, phase within the per-x tolerance) still run in NumPy, in
+  `verify` and in the `invsqrt` diff plug-in; they have not been ported to Rust, so invsqrt gains less than DQI.
+- `diff`: Toffoli counts are per 256-shot simulator, not per shot. Pairing by seed is exact only for rewrites that keep
+  the measurement structure. The structural layer reports op indices, not op text. A predicted cost is a projection
+  from sampled draws; only the official verifier gives a score.
+- `qrom-plan` is a source-only workspace crate (`cargo build --release -p qrom-plan`); it is not in the Python wheel.
 - `circuit_sha256` is the SHA-256 of the file bytes. The official verifier hashes kickmix's re-serialisation of the
   circuit. The two are equal for canonical `.kmb` files (as written by kickmix), and `--cross-check` compares them on
   every run. A non-canonical file would get different seeds, and the cross-check would report it.
