@@ -33,8 +33,39 @@ pub const K_PUSH: u8 = 16;
 pub const K_INFO: u8 = 17;
 /// Stream only: run header of plain (bit-unconditioned) CX ops; counted as CX.
 pub const K_CXRUN: u8 = 18;
+/// Stream only: run header of "uniform" gates (NEG, Z, X, CZ, CX, CCZ, CCX, with or without a bit condition), each
+/// executed branch-free as `t = base & bits[cb] & q[a] & q[b] & q[c]; q[d] ^= t` with the constant slots below.
+/// Layout: `K_UNIRUN | count << 8`, the number of condition groups, then per group `UNI_GROUP` words (the condition
+/// bit slot and a histogram of the group's ops per `UNI_KINDS` kind, for the counts), then `UNI_ENTRY` words per
+/// entry: `a | b << 16`, `c | d << 16`, the condition bit slot.
+pub const K_UNIRUN: u8 = 19;
 /// Number of count slots (kinds 0..=17).
 pub const NCOUNT: usize = 18;
+/// Kinds a uniform run may hold, in histogram order.
+pub const UNI_KINDS: [u8; 7] = [K_NEG, K_Z, K_X, K_CZ, K_CX, K_CCZ, K_CCX];
+pub const UNI_GROUP: usize = 1 + UNI_KINDS.len();
+pub const UNI_ENTRY: usize = 3;
+/// Classical-bit array layout of a `Sim`: slot 0 is the constant all-ones bit (the condition of an unconditioned
+/// uniform entry); compact bit `i` lives at slot `i + B_OFF`. Every bit operand in the stream is already offset.
+pub const B_ONES: u32 = 0;
+pub const B_OFF: u32 = 1;
+/// Qubit-array layout of a `Sim`: slot 0 is constant all-ones (absent operands of a uniform entry read it), slots
+/// `Q_DUMMY .. Q_DUMMY + N_DUMMY` are write-only sinks that phase entries (NEG, Z, CZ, CCZ) XOR into in rotation,
+/// so that the loop stays branch-free while the phase itself accumulates in a register and consecutive phase ops
+/// never form a read-modify-write chain through one slot, and qubit `i` lives at slot `i + Q_OFF`. Every qubit
+/// operand in the stream is already offset.
+pub const Q_ONES: u32 = 0;
+pub const Q_DUMMY: u32 = 1;
+pub const N_DUMMY: u32 = 8;
+pub const Q_OFF: u32 = Q_DUMMY + N_DUMMY;
+/// Plain CX stretches at least this long are emitted as a `K_CXRUN` (its loop is cheaper than the uniform one);
+/// shorter ones join the surrounding uniform run.
+pub const CX_RUN_MIN: usize = 8;
+
+/// Histogram slot of a uniform kind.
+pub fn uni_slot(k: u8) -> Option<usize> {
+    UNI_KINDS.iter().position(|&u| u == k)
+}
 pub const KIND_NAMES: [&str; NCOUNT] = [
     "NEG", "POP_CONDITION", "BIT_STORE0", "BIT_STORE1", "BIT_INVERT", "Z", "X", "R", "Z_POW", "HMR", "CZ", "CX",
     "SWAP", "CCZ", "CCX", "CSWAP", "PUSH_CONDITION", "INFO_TAG",
@@ -110,6 +141,8 @@ pub struct Program {
     pub n_info_tags: u64,
     pub max_stack_depth: usize,
     pub n_cx_runs: usize,
+    /// Uniform runs in the stream (see `K_UNIRUN`).
+    pub n_uni_runs: usize,
     /// kickmix `Circuit.reaction_depth()`, computed once while compiling (see `ReactionDepth`).
     pub reaction_depth: u64,
     /// Static per-kind op counts (as `circuit.operation_statistics()`), count slots.
@@ -129,9 +162,13 @@ pub struct Builder {
     n_info: u64,
     maxq: i64,
     maxb: i64,
-    run_hdr: Option<usize>,
-    run_len: usize,
+    /// Uniform-kind ops not yet emitted: (kind, offset qubit operands, condition bit slot). Flushed into CX runs,
+    /// uniform runs and single ops by the next non-uniform op or `finish`.
+    pending: Vec<(u8, [u32; 3], u32)>,
     n_runs: usize,
+    n_uni: usize,
+    /// Phase entries emitted so far (selects the next sink slot).
+    n_phase: u32,
     depth: usize,
     max_depth: usize,
     static_counts: [u64; NCOUNT],
@@ -376,9 +413,10 @@ impl Builder {
             n_info: 0,
             maxq: -1,
             maxb: -1,
-            run_hdr: None,
-            run_len: 0,
+            pending: Vec::new(),
             n_runs: 0,
+            n_uni: 0,
+            n_phase: 0,
             depth: 0,
             max_depth: 0,
             static_counts: [0; NCOUNT],
@@ -402,10 +440,137 @@ impl Builder {
         v
     }
 
-    fn close_run(&mut self) {
-        if let Some(h) = self.run_hdr.take() {
-            self.code[h] = K_CXRUN as u32 | ((self.run_len as u32) << 8);
-            self.run_len = 0;
+    /// Emit the pending uniform-kind ops: maximal plain-CX stretches of at least `CX_RUN_MIN` as CX runs, every
+    /// other stretch of two or more as a uniform run, a lone op as an ordinary interpreter op.
+    fn flush_pending(&mut self) {
+        if self.pending.is_empty() {
+            return;
+        }
+        let pend = std::mem::take(&mut self.pending);
+        let n = pend.len();
+        let plain_cx = |e: &(u8, [u32; 3], u32)| e.0 == K_CX && e.2 == B_ONES;
+        let cx_stretch = |from: usize| -> usize {
+            let mut j = from;
+            while j < n && plain_cx(&pend[j]) {
+                j += 1;
+            }
+            j
+        };
+        let mut i = 0;
+        while i < n {
+            if plain_cx(&pend[i]) {
+                let j = cx_stretch(i);
+                if j - i >= CX_RUN_MIN {
+                    self.emit_cx_run(&pend[i..j]);
+                    i = j;
+                    continue;
+                }
+            }
+            let mut j = i;
+            while j < n {
+                if plain_cx(&pend[j]) {
+                    let k = cx_stretch(j);
+                    if k - j >= CX_RUN_MIN {
+                        break;
+                    }
+                    j = k;
+                } else {
+                    j += 1;
+                }
+            }
+            self.emit_uniform(&pend[i..j]);
+            i = j;
+        }
+        self.pending = pend;
+        self.pending.clear();
+    }
+
+    fn emit_cx_run(&mut self, seg: &[(u8, [u32; 3], u32)]) {
+        for part in seg.chunks(MAX_RUN) {
+            self.code.push(K_CXRUN as u32 | ((part.len() as u32) << 8));
+            for &(_, q, _) in part {
+                self.code.push(q[0] | (q[1] << 16));
+            }
+            self.n_runs += 1;
+        }
+    }
+
+    /// Uniform entry (a, b, c, d) of a plain op with offset qubits: `t = cond & q[a] & q[b] & q[c]; q[d] ^= t`, and
+    /// `phase ^= t` when `d` is a sink slot (phase ops take the sinks in rotation).
+    fn uni_entry(&mut self, kind: u8, q: &[u32; 3]) -> [u32; 4] {
+        let mut sink = || {
+            let d = Q_DUMMY + self.n_phase % N_DUMMY;
+            self.n_phase += 1;
+            d
+        };
+        match kind {
+            K_NEG => [Q_ONES, Q_ONES, Q_ONES, sink()],
+            K_Z => [q[0], Q_ONES, Q_ONES, sink()],
+            K_X => [Q_ONES, Q_ONES, Q_ONES, q[0]],
+            K_CZ => [q[0], q[1], Q_ONES, sink()],
+            K_CX => [q[0], Q_ONES, Q_ONES, q[1]],
+            K_CCZ => [q[0], q[1], q[2], sink()],
+            K_CCX => [q[0], q[1], Q_ONES, q[2]],
+            _ => unreachable!("not a uniform kind"),
+        }
+    }
+
+    fn emit_uniform(&mut self, seg: &[(u8, [u32; 3], u32)]) {
+        if seg.len() == 1 {
+            let (kind, q, cb) = seg[0];
+            self.emit_plain(kind, if cb == B_ONES { None } else { Some(cb) }, &q[..nq_of(kind)], None, None);
+            return;
+        }
+        for part in seg.chunks(MAX_RUN) {
+            self.code.push(K_UNIRUN as u32 | ((part.len() as u32) << 8));
+            // Condition groups in order of first appearance: (bit slot, histogram over UNI_KINDS).
+            let mut groups: Vec<(u32, [u32; UNI_KINDS.len()])> = Vec::new();
+            for &(kind, _, cb) in part {
+                let g = match groups.iter().position(|g| g.0 == cb) {
+                    Some(g) => g,
+                    None => {
+                        groups.push((cb, [0; UNI_KINDS.len()]));
+                        groups.len() - 1
+                    }
+                };
+                groups[g].1[uni_slot(kind).unwrap()] += 1;
+            }
+            self.code.push(groups.len() as u32);
+            for (cb, hist) in &groups {
+                self.code.push(*cb);
+                self.code.extend_from_slice(hist);
+            }
+            for &(kind, q, cb) in part {
+                let e = self.uni_entry(kind, &q);
+                self.code.push(e[0] | (e[1] << 16));
+                self.code.push(e[2] | (e[3] << 16));
+                self.code.push(cb);
+            }
+            self.n_uni += 1;
+        }
+    }
+
+    /// One ordinary interpreter op: qubits already offset, `cond` and `bit` as offset compact bit slots.
+    fn emit_plain(&mut self, kind: u8, cond: Option<u32>, qs: &[u32], bit: Option<u32>, angle: Option<u128>) {
+        let nq = qs.len();
+        let opc = if cond.is_some() && kind != K_PUSH { kind | IF } else { kind };
+        let a = if nq >= 1 { qs[0] } else { 0 };
+        self.code.push(opc as u32 | (a << 16));
+        if nq == 2 {
+            self.code.push(qs[1]);
+        } else if nq == 3 {
+            self.code.push(qs[1] | (qs[2] << 16));
+        }
+        if let Some(c) = bit {
+            self.code.push(c);
+        }
+        if let Some(v) = angle {
+            self.angles.push(v);
+            self.levels.push(angle_level(v));
+            self.code.push((self.angles.len() - 1) as u32);
+        }
+        if let Some(c) = cond {
+            self.code.push(c);
         }
     }
 
@@ -425,8 +590,8 @@ impl Builder {
             return Err(format!("kind {} needs {} qubits, got {}", KIND_NAMES[kind as usize], nq, qs.len()));
         }
         for &q in qs {
-            if q > 0xFFFF {
-                return Err("qubit id exceeds 65535".into());
+            if q + Q_OFF > 0xFFFF {
+                return Err(format!("qubit id exceeds {}", 0xFFFF - Q_OFF));
             }
             self.maxq = self.maxq.max(q as i64);
         }
@@ -458,47 +623,27 @@ impl Builder {
             K_HMR | K_R => self.nrand += 1,
             _ => {}
         }
-        if kind == K_CX && cond.is_none() {
-            if self.run_hdr.is_none() || self.run_len >= MAX_RUN {
-                self.close_run();
-                self.run_hdr = Some(self.code.len());
-                self.code.push(0);
-                self.n_runs += 1;
-            }
-            self.code.push(qs[0] | (qs[1] << 16));
-            self.run_len += 1;
+        let mut oq = [0u32; 3];
+        for (i, &q) in qs.iter().enumerate() {
+            oq[i] = q + Q_OFF;
+        }
+        // Compact bit ids are assigned in op order (bit target first, as the stream lists them).
+        let bit_c = bit.map(|b| self.cb(b) + B_OFF);
+        let cond_c = cond.map(|c| self.cb(c) + B_OFF);
+        if uni_slot(kind).is_some() {
+            self.pending.push((kind, oq, cond_c.unwrap_or(B_ONES)));
             return Ok(());
         }
-        self.close_run();
-        let opc = if cond.is_some() && kind != K_PUSH { kind | IF } else { kind };
-        let a = if nq >= 1 { qs[0] } else { 0 };
-        self.code.push(opc as u32 | (a << 16));
-        if nq == 2 {
-            self.code.push(qs[1]);
-        } else if nq == 3 {
-            self.code.push(qs[1] | (qs[2] << 16));
+        self.flush_pending();
+        if angle.is_some() && self.angles.len() >= u32::MAX as usize {
+            return Err("angle table too large".into());
         }
-        if let Some(b) = bit {
-            let c = self.cb(b);
-            self.code.push(c);
-        }
-        if let Some(v) = angle {
-            if self.angles.len() >= u32::MAX as usize {
-                return Err("angle table too large".into());
-            }
-            self.angles.push(v);
-            self.levels.push(angle_level(v));
-            self.code.push((self.angles.len() - 1) as u32);
-        }
-        if let Some(c) = cond {
-            let c = self.cb(c);
-            self.code.push(c);
-        }
+        self.emit_plain(kind, cond_c, &oq[..nq], bit_c, angle);
         Ok(())
     }
 
     pub fn finish(mut self, num_qubits: usize, num_bits: usize, registers: Vec<(String, Vec<(bool, u32)>)>) -> Program {
-        self.close_run();
+        self.flush_pending();
         self.code.shrink_to_fit();
         let num_qubits = num_qubits.max((self.maxq + 1) as usize);
         let orig_num_bits = num_bits.max((self.maxb + 1) as usize);
@@ -518,6 +663,7 @@ impl Builder {
             n_info_tags: self.n_info,
             max_stack_depth: self.max_depth,
             n_cx_runs: self.n_runs,
+            n_uni_runs: self.n_uni,
             reaction_depth: self.rd.max_depth(),
             static_counts: self.static_counts,
             registers,
@@ -907,7 +1053,9 @@ impl KmbOps {
 
 pub const CACHE_MAGIC: &[u8; 8] = b"KMXEPRG\0";
 /// Bump whenever the IR or this layout changes. Format 2 (0.3.0) adds `reaction_depth` as a ninth scalar field.
-pub const CACHE_FORMAT: u32 = 2;
+/// Format 3 offsets qubit operands by `Q_OFF` and bit operands by `B_OFF`, adds `K_UNIRUN` and `n_uni_runs` as a
+/// tenth scalar field.
+pub const CACHE_FORMAT: u32 = 3;
 
 /// Streaming 64-bit checksum (4 multiply-rotate lanes over 8-byte words; independent of how the bytes are split
 /// into calls). Detects truncation and corruption; it is not a cryptographic hash.
@@ -991,7 +1139,7 @@ impl Program {
         head.extend_from_slice(CACHE_MAGIC);
         head.extend_from_slice(&CACHE_FORMAT.to_le_bytes());
         for v in [self.num_qubits, self.num_bits, self.orig_num_bits, self.nrand, self.n_source_ops, self.n_info_tags as usize,
-                  self.max_stack_depth, self.n_cx_runs, self.reaction_depth as usize] {
+                  self.max_stack_depth, self.n_cx_runs, self.reaction_depth as usize, self.n_uni_runs] {
             head.extend_from_slice(&(v as u64).to_le_bytes());
         }
         for v in self.static_counts {
@@ -1047,7 +1195,7 @@ impl Program {
         if &magic[..8] != CACHE_MAGIC || u32::from_le_bytes(magic[8..12].try_into().unwrap()) != CACHE_FORMAT {
             return Err("not a program cache file of this format version".into());
         }
-        let mut sc = [0u64; 9];
+        let mut sc = [0u64; 10];
         for v in sc.iter_mut() {
             *v = u64s(&mut r, &mut take, &mut hdr)?;
         }
@@ -1119,6 +1267,7 @@ impl Program {
             max_stack_depth: sc[6] as usize,
             n_cx_runs: sc[7] as usize,
             reaction_depth: sc[8],
+            n_uni_runs: sc[9] as usize,
             static_counts,
             registers,
         };
@@ -1133,7 +1282,15 @@ impl Program {
     /// Walk the stream and check every operand is in range (the interpreter uses unchecked indexing).
     pub fn validate(&self) -> Result<(), String> {
         let lens = op_len_table();
-        let (nq, nb, na) = (self.num_qubits as u32, self.num_bits as u32, self.angles.len() as u32);
+        let na = self.angles.len() as u32;
+        let top = self.num_qubits as u32 + Q_OFF;
+        let btop = self.num_bits as u32 + B_OFF;
+        // A real qubit slot: offset ids only (the constant slots are never operands of an ordinary op).
+        let qok = |q: u32| q >= Q_OFF && q < top;
+        // A bit slot of a uniform entry or group: the all-ones bit or a real compact bit.
+        let bok = |b: u32| b == B_ONES || (b >= B_OFF && b < btop);
+        // A bit operand of an ordinary op: a real compact bit.
+        let brk = |b: u32| b >= B_OFF && b < btop;
         let c = &self.code;
         let mut i = 0usize;
         let mut depth = 0usize;
@@ -1146,11 +1303,42 @@ impl Program {
                     return Err("cache stream: CX run overruns".into());
                 }
                 for &e in &c[i + 1..i + 1 + n] {
-                    if (e & 0xFFFF) >= nq || (e >> 16) >= nq {
+                    if !qok(e & 0xFFFF) || !qok(e >> 16) {
                         return Err("cache stream: qubit out of range".into());
                     }
                 }
                 i += 1 + n;
+                continue;
+            }
+            if op == K_UNIRUN {
+                let n = (w0 >> 8) as usize;
+                if i + 2 > c.len() {
+                    return Err("cache stream: uniform run overruns".into());
+                }
+                let ng = c[i + 1] as usize;
+                let hdr = 2 + UNI_GROUP * ng;
+                if ng > n.max(1) || i + hdr + UNI_ENTRY * n > c.len() {
+                    return Err("cache stream: uniform run overruns".into());
+                }
+                let mut hist = 0u64;
+                for g in c[i + 2..i + hdr].chunks_exact(UNI_GROUP) {
+                    if !bok(g[0]) {
+                        return Err("cache stream: uniform group condition bit out of range".into());
+                    }
+                    hist += g[1..].iter().map(|&h| h as u64).sum::<u64>();
+                }
+                if hist != n as u64 {
+                    return Err("cache stream: uniform run histogram does not match its length".into());
+                }
+                for e in c[i + hdr..i + hdr + UNI_ENTRY * n].chunks_exact(UNI_ENTRY) {
+                    let (a, b, cc, d) = (e[0] & 0xFFFF, e[0] >> 16, e[1] & 0xFFFF, e[1] >> 16);
+                    let src_ok = |q: u32| q == Q_ONES || qok(q);
+                    let sink = d >= Q_DUMMY && d < Q_DUMMY + N_DUMMY;
+                    if !src_ok(a) || !src_ok(b) || !src_ok(cc) || !(sink || qok(d)) || !bok(e[2]) {
+                        return Err("cache stream: uniform entry out of range".into());
+                    }
+                }
+                i += hdr + UNI_ENTRY * n;
                 continue;
             }
             let len = lens[op as usize] as usize;
@@ -1159,19 +1347,19 @@ impl Program {
             }
             let base = op & !IF;
             let nqo = nq_of(base);
-            if nqo >= 1 && (w0 >> 16) >= nq {
+            if nqo >= 1 && !qok(w0 >> 16) {
                 return Err("cache stream: qubit out of range".into());
             }
             let mut k = i + 1;
             if nqo >= 2 {
                 let w = c[k];
-                if (w & 0xFFFF) >= nq || (nqo == 3 && (w >> 16) >= nq) {
+                if !qok(w & 0xFFFF) || (nqo == 3 && !qok(w >> 16)) {
                     return Err("cache stream: qubit out of range".into());
                 }
                 k += 1;
             }
             if has_bit_target(base) {
-                if c[k] >= nb {
+                if !brk(c[k]) {
                     return Err("cache stream: bit out of range".into());
                 }
                 k += 1;
@@ -1183,7 +1371,7 @@ impl Program {
                 k += 1;
             }
             if op & IF != 0 || base == K_PUSH {
-                if c[k] >= nb {
+                if !brk(c[k]) {
                     return Err("cache stream: condition bit out of range".into());
                 }
             }

@@ -57,6 +57,9 @@ impl PyProgram {
     fn max_stack_depth(&self) -> usize { self.inner.max_stack_depth }
     #[getter]
     fn num_cx_runs(&self) -> usize { self.inner.n_cx_runs }
+    /// Uniform runs (branch-free stretches of plain NEG/Z/X/CZ/CX/CCZ/CCX) in the stream.
+    #[getter]
+    fn num_uni_runs(&self) -> usize { self.inner.n_uni_runs }
     /// kickmix `Circuit.reaction_depth()`, computed once at compile time and stored in the program cache.
     #[getter]
     fn reaction_depth(&self) -> u64 { self.inner.reaction_depth }
@@ -100,8 +103,11 @@ fn derive_keys<'py>(py: Python<'py>, seed: [u32; 8], nsims: usize) -> Bound<'py,
     PyArray1::from_vec(py, flat)
 }
 
+/// `check=(target, tol)` (uint64 tables indexed by x - 1) runs the invsqrt per-shot check on the engine and returns
+/// per-chunk `check_min_margin`, `check_worst_ratio`, `check_worst_x` and `check_fail` [n_chunks * 6] instead of
+/// the per-shot arrays (see `engine::CheckOut`).
 #[pyfunction]
-#[pyo3(signature = (prog, seeds, xs, xreg, s, b, threads=1, counting=true, dump=false))]
+#[pyo3(signature = (prog, seeds, xs, xreg, s, b, threads=1, counting=true, dump=false, check=None))]
 #[allow(clippy::too_many_arguments)]
 fn run<'py>(
     py: Python<'py>,
@@ -114,6 +120,7 @@ fn run<'py>(
     threads: usize,
     counting: bool,
     dump: bool,
+    check: Option<(PyReadonlyArray1<'py, u64>, PyReadonlyArray1<'py, u64>)>,
 ) -> PyResult<Bound<'py, PyDict>> {
     let sd = seeds.as_array();
     if sd.ncols() != 8 {
@@ -121,17 +128,32 @@ fn run<'py>(
     }
     let seeds_v: Vec<[u32; 8]> = sd.rows().into_iter().map(|r| { let mut a = [0u32; 8]; for i in 0..8 { a[i] = r[i]; } a }).collect();
     let xs_s = xs.as_slice()?;
+    if check.is_some() && dump {
+        return Err(PyValueError::new_err("check and dump cannot be combined"));
+    }
+    let ck_tabs = match &check {
+        Some((t, l)) => Some((t.as_slice()?, l.as_slice()?)),
+        None => None,
+    };
+    let ck = ck_tabs.map(|(target, tol)| engine::Check { target, tol });
     let p = prog.inner.clone();
     let out = py
         .detach(|| {
-            let spec = engine::RunSpec { prog: &p, seeds: &seeds_v, s, b, xs: xs_s, xreg: &xreg, counting, dump, threads };
+            let spec = engine::RunSpec { prog: &p, seeds: &seeds_v, s, b, xs: xs_s, xreg: &xreg, counting, dump, threads, check: ck.as_ref() };
             engine::run(&spec)
         })
         .map_err(PyValueError::new_err)?;
     let d = PyDict::new(py);
-    d.set_item("x_out", PyArray1::from_vec(py, out.x_out))?;
-    d.set_item("scratch_dirty", PyArray1::from_vec(py, out.dirty))?;
-    d.set_item("phase_units", PyArray1::from_vec(py, out.units))?;
+    if let Some(c) = out.check {
+        d.set_item("check_min_margin", PyArray1::from_vec(py, c.min_margin))?;
+        d.set_item("check_worst_ratio", PyArray1::from_vec(py, c.worst_ratio))?;
+        d.set_item("check_worst_x", PyArray1::from_vec(py, c.worst_x))?;
+        d.set_item("check_fail", PyArray1::from_vec(py, c.fail))?;
+    } else {
+        d.set_item("x_out", PyArray1::from_vec(py, out.x_out))?;
+        d.set_item("scratch_dirty", PyArray1::from_vec(py, out.dirty))?;
+        d.set_item("phase_units", PyArray1::from_vec(py, out.units))?;
+    }
     d.set_item("kind_counts", PyArray1::from_vec(py, out.kind_counts))?;
     d.set_item("z_levels", PyArray1::from_vec(py, out.z_levels))?;
     if dump {

@@ -13,6 +13,10 @@ impl W {
     pub const ZERO: W = W([0; 4]);
     pub const ONES: W = W([!0; 4]);
     #[inline(always)]
+    pub const fn splat(x: u64) -> W {
+        W([x; 4])
+    }
+    #[inline(always)]
     pub fn popcnt(self) -> u64 {
         (self.0[0].count_ones() + self.0[1].count_ones() + self.0[2].count_ones() + self.0[3].count_ones()) as u64
     }
@@ -103,9 +107,13 @@ impl Sim {
     /// A sim with room for `num_qubits` qubits and `num_bits` compact bits, so several programs can run on it in
     /// turn (each program's ids are below its own counts; see `engine::run_sequence`).
     pub fn with_dims(num_qubits: usize, num_bits: usize, max_stack_depth: usize, keys: Keys) -> Sim {
+        let mut q = vec![W::ZERO; num_qubits + Q_OFF as usize];
+        q[Q_ONES as usize] = W::ONES;
+        let mut bits = vec![W::ZERO; num_bits + B_OFF as usize];
+        bits[B_ONES as usize] = W::ONES;
         Sim {
-            q: vec![W::ZERO; num_qubits.max(1)],
-            bits: vec![W::ZERO; num_bits.max(1)],
+            q,
+            bits,
             phase: W::ZERO,
             angles: vec![0u128; 256],
             stack: Vec::with_capacity(max_stack_depth.max(8)),
@@ -114,10 +122,35 @@ impl Sim {
         }
     }
 
+    /// Qubit `i` (the array holds the constant slots first; see `program::Q_OFF`).
+    #[inline(always)]
+    pub fn qb(&self, i: usize) -> W {
+        self.q[i + Q_OFF as usize]
+    }
+    #[inline(always)]
+    pub fn qb_mut(&mut self, i: usize) -> &mut W {
+        &mut self.q[i + Q_OFF as usize]
+    }
+    /// Compact classical bit `i` (slot 0 of the array is the constant all-ones bit; see `program::B_OFF`).
+    #[inline(always)]
+    pub fn bt(&self, i: usize) -> W {
+        self.bits[i + B_OFF as usize]
+    }
+    #[inline(always)]
+    pub fn bt_mut(&mut self, i: usize) -> &mut W {
+        &mut self.bits[i + B_OFF as usize]
+    }
+    /// Number of compact classical bits this sim holds.
+    pub fn num_bits(&self) -> usize {
+        self.bits.len() - B_OFF as usize
+    }
+
     /// kickmix `clear_for_shot`: zeroes qubits, bits, phase, angles, condition stack; the RNG stream continues.
     pub fn clear_for_shot(&mut self) {
         self.q.fill(W::ZERO);
+        self.q[Q_ONES as usize] = W::ONES;
         self.bits.fill(W::ZERO);
+        self.bits[B_ONES as usize] = W::ONES;
         self.phase = W::ZERO;
         self.angles.fill(0);
         self.stack.clear();
@@ -214,13 +247,60 @@ impl Sim {
                 counts.full[K_INFO as usize] += prog.n_info_tags;
             }
         }
-        // SAFETY: the Builder guarantees qubit ids < num_qubits (Sim::new sizes q from it), compact bit ids <
-        // num_bits, angle indices < angles.len(), every opcode has its OP_LEN words and run headers are followed
-        // by that many entries.
+        // SAFETY: the Builder guarantees qubit slots < num_qubits + Q_OFF (Sim::new sizes q from it; uniform
+        // entries read slot Q_ONES and write slot Q_PHASE), compact bit ids < num_bits, angle indices <
+        // angles.len(), every opcode has its OP_LEN words and run headers are followed by that many entries
+        // (`Program::validate` re-checks a loaded cache file).
         unsafe {
             while i < n {
                 let w0 = *code.add(i);
                 let opc = (w0 & 0xFF) as u8;
+                if opc == K_UNIRUN {
+                    // Branch-free run of NEG/Z/X/CZ/CX/CCZ/CCX, bit-conditioned or not:
+                    // `t = base & bits[cb] & q[a] & q[b] & q[c]; q[d] ^= t`, absent operands reading the all-ones
+                    // qubit slot and unconditioned entries the all-ones bit slot; a phase entry's `d` is a sink slot,
+                    // which also selects (without a branch) the XOR of `t` into the register-resident phase. Counts:
+                    // one popcount per condition group (entries sharing a condition bit) times its static histogram,
+                    // which equals the per-op `cond.popcnt()` of the ordinary path.
+                    let cnt = (w0 >> 8) as usize;
+                    let ngroups = *code.add(i + 1) as usize;
+                    let groups = code.add(i + 2);
+                    let ent = code.add(i + 2 + UNI_GROUP * ngroups);
+                    i += 2 + UNI_GROUP * ngroups + UNI_ENTRY * cnt;
+                    if COUNT {
+                        for g in 0..ngroups {
+                            let gw = groups.add(UNI_GROUP * g);
+                            let cb = *gw as usize;
+                            let hist = gw.add(1);
+                            if MASK {
+                                let m = (base & *bp.add(cb) & lanes).popcnt();
+                                for k in 0..UNI_KINDS.len() {
+                                    counts.part[UNI_KINDS[k] as usize] += *hist.add(k) as u64 * m;
+                                }
+                            } else if full && cb == B_ONES as usize {
+                                for k in 0..UNI_KINDS.len() {
+                                    counts.full[UNI_KINDS[k] as usize] += *hist.add(k) as u64;
+                                }
+                            } else {
+                                let m = (base & *bp.add(cb)).popcnt();
+                                for k in 0..UNI_KINDS.len() {
+                                    counts.part[UNI_KINDS[k] as usize] += *hist.add(k) as u64 * m;
+                                }
+                            }
+                        }
+                    }
+                    for j in 0..cnt {
+                        let e0 = *ent.add(UNI_ENTRY * j);
+                        let e1 = *ent.add(UNI_ENTRY * j + 1);
+                        let cb = *ent.add(UNI_ENTRY * j + 2) as usize;
+                        let d = (e1 >> 16) as usize;
+                        let t = base & *bp.add(cb) & *qp.add((e0 & 0xFFFF) as usize) & *qp.add((e0 >> 16) as usize) & *qp.add((e1 & 0xFFFF) as usize);
+                        let pm = W::splat(((d.wrapping_sub(Q_DUMMY as usize) < N_DUMMY as usize) as u64).wrapping_neg());
+                        phase ^= t & pm;
+                        *qp.add(d) ^= t;
+                    }
+                    continue;
+                }
                 if opc == K_CXRUN {
                     let cnt = (w0 >> 8) as usize;
                     let run = code.add(i + 1);

@@ -124,26 +124,26 @@ class InvSqrtTask:
             def sim(group):
                 nb = (group[0][1] - group[0][0]) // batch_size
                 xs = np.stack([v.sample_shots(spec, t[0], t[1]).reshape(nb, batch_size) for t in group])
-                out = run(prog, [seed_words(t[2]) for t in group], xs, x_ids, s=1, threads=threads, counting=True)
+                out = run(prog, [seed_words(t[2]) for t in group], xs, x_ids, s=1, threads=threads, counting=True,
+                          check=(target, tol))
                 return xs, out
 
             min_margin = 1 << 64
             worst = (-1.0, 0)
             tof = tcount = nrot = 0
-            lv = np.arange(129)
             pending = [ex.submit(sim, groups[0])]
             for gi, group in enumerate(groups):
                 xs, out = pending.pop(0).result()
                 if gi + 1 < len(groups):
                     pending.append(ex.submit(sim, groups[gi + 1]))
-                fail, allowed, used = self._check_group(group, xs, out, target, tol, scratch, x_ids)
+                fail = self._first_failure(group, xs, out, scratch, x_ids)
                 if fail is not None:
                     raise AssertionError(fail)
-                xf, allowed, used = xs.reshape(-1), allowed.reshape(-1), used.reshape(-1)
-                ratio = np.divide(used, allowed, out=np.zeros(len(xf)), where=allowed > 0)
-                min_margin = min(min_margin, int((allowed - used).min()))
-                rmax = float(ratio.max())
-                worst = max(worst, (rmax, -int(xf[ratio == rmax].min())))
+                # The verifier's folds: min margin over all shots; (|error| / tol, -x) tuple max over all shots.
+                min_margin = min(min_margin, int(out['check_min_margin'].min()))
+                wr = out['check_worst_ratio']
+                rmax = float(wr.max())
+                worst = max(worst, (rmax, -int(out['check_worst_x'][wr == rmax].min())))
                 tof += int(out['toffoli_count'].sum())
                 zl = out['z_levels']
                 tcount += int(zl[:, 3].sum())
@@ -179,8 +179,30 @@ class InvSqrtTask:
             'circuit_sha256': self.circuit_hash,
         }
 
+    def _first_failure(self, group, xs, out, scratch, x_ids):
+        """The official failure message for the first failing batch of a group checked on the engine, or None."""
+        fails = out['check_fail']  # [chunk, 6]: batch, priority, shot, x, error, allowed
+        bad = np.flatnonzero(fails[:, 0] >= 0)
+        if not len(bad):
+            return None
+        c = int(bad[0])
+        b, prio, sh, x, err, allowed = (int(v) for v in fails[c])
+        if prio == 0:
+            return 'x was not restored.'
+        if prio == 1 and len(scratch):
+            # Name the first dirty scratch qubit like the official message: re-run this chunk with a state dump.
+            t = group[c]
+            o = run(self.prog, [seed_words(t[2])], xs[c:c + 1, :b + 1], x_ids, s=1, threads=1, counting=False,
+                    dump=True)
+            q = o['dump_q'][b]  # [nq, 4] words of this batch
+            dq = np.array([q[i].any() for i in scratch])
+            return f'Scratch qubit q{scratch[int(np.argmax(dq))]} did not return to |0>.'
+        return (f'x={x}: phase error {float(err) / 2**64:.3e} turns '
+                f'exceeds tolerance {float(allowed) / 2**64:.3e}.')
+
     def _check_group(self, group, xs, out, target, tol, scratch, x_ids):
-        """The official per-batch checks in task order; returns (first failure message or None, allowed, used)."""
+        """NumPy restatement of the official per-batch checks (kept as the reference for the engine check's tests);
+        returns (first failure message or None, allowed, used)."""
         bad_x = (out['x_out'] != xs).any(axis=2)          # [chunk, batch]
         dirty = out['scratch_dirty'].astype(bool).any(axis=2)
         theta = out['phase_units']

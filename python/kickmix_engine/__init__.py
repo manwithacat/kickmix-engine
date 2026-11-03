@@ -56,20 +56,34 @@ def compile_circuit(circuit) -> Program:
     return compile_text(str(circuit), circuit.num_qubits)
 
 
-def run(prog: Program, seeds, xs, xreg, *, s: int = 1, threads: int = 1, counting: bool = True, dump: bool = False):
+def run(prog: Program, seeds, xs, xreg, *, s: int = 1, threads: int = 1, counting: bool = True, dump: bool = False,
+        check=None):
     """Run chunks. seeds: uint32 [n_chunks, 8] (or python ints); xs: uint64 [n_chunks, B, 256*s].
 
     Returns dict of arrays shaped like xs: x_out (register read back), scratch_dirty (any scratch qubit nonzero),
     phase_units (verifier's 2^-64-turn integers); kind_counts [n_chunks, len(KINDS)] (see KINDS) and z_levels [n_chunks, 129]
     (Z_POW counts by Clifford-hierarchy level); toffoli_count [n_chunks] (CCX+CCZ+CSWAP, summed over shots).
     GIL is released during simulation. With dump=True also dump_* arrays (bit-sliced final state per 256-shot batch).
+
+    ``check=(target, tol)`` (uint64 tables indexed by x - 1, the invsqrt verifier's ``reference_values``) runs the
+    verifier's per-shot check on the engine instead of returning the per-shot arrays: ``check_min_margin`` [n_chunks]
+    (min tol - |error|), ``check_worst_ratio`` and ``check_worst_x`` [n_chunks] (largest |error| / tol, smallest x
+    on ties) and ``check_fail`` int64 [n_chunks, 6]: batch (-1 if the chunk passed), priority (0 x not restored,
+    1 scratch dirty, 2 phase out of tolerance), shot, x, error, allowed, for the first failing batch of the chunk.
     """
     seeds = np.asarray([seed_words(x) if isinstance(x, int) else x for x in seeds], dtype=np.uint32).reshape(-1, 8)
     xs = np.ascontiguousarray(xs, dtype=np.uint64)
     n_chunks, b, per = xs.shape
     assert per == 256 * s and n_chunks == len(seeds)
-    r = _run(prog, seeds, xs.reshape(-1), [int(q) for q in xreg], s, b, threads, counting, dump)
+    if check is not None:
+        check = (np.ascontiguousarray(check[0], dtype=np.uint64), np.ascontiguousarray(check[1], dtype=np.uint64))
+    r = _run(prog, seeds, xs.reshape(-1), [int(q) for q in xreg], s, b, threads, counting, dump, check)
     out = {k: v.reshape(n_chunks, b, per) for k, v in r.items() if k in ("x_out", "scratch_dirty", "phase_units")}
+    if check is not None:
+        out["check_min_margin"] = r["check_min_margin"]
+        out["check_worst_ratio"] = r["check_worst_ratio"]
+        out["check_worst_x"] = r["check_worst_x"]
+        out["check_fail"] = r["check_fail"].reshape(n_chunks, 6)
     kc = r["kind_counts"].reshape(n_chunks, len(KINDS))
     out["kind_counts"] = kc
     out["z_levels"] = r["z_levels"].reshape(n_chunks, 129)
