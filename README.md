@@ -298,23 +298,23 @@ DQI `e3928244a1c1`, and the chemistry family HW-13 (15 `ANGLE_k` circuits). Mach
 4 efficiency cores), 16 GB, macOS 26.7.2. Baseline: the unmodified official verifier CLIs on kickmix 1.0.0 (PyPI
 wheel) in a clean pyenv Python 3.12.11 venv, at 1 and 4 `--max-workers`. The chemistry verifier has no worker
 option, so it runs single-process. Engine: `kickmix-engine verify` at 1 and 4 threads with a warm program and FCIDUMP
-cache. The simulator code is the same in 0.6.0 as in the measured build, commit 7dcd7b6. Times are the wall clock of
+cache. The kickmix 1.0.0 columns and the chemistry row were measured on commit 7dcd7b6; the engine invsqrt and DQI cells were re-measured on the 0.6.0 simulator (uniform runs and lockstep pairs, commit 01cd212) as medians of three back-to-back runs at a lower 1-minute load (1.3-4.3), so those two ratios combine two sessions. On the same machine and session, 0.6.0 against 7dcd7b6: invsqrt 166.2 s -> 79.1 s (1 thread) and 45.7 s -> 23.3 s (4 threads); DQI 40.1 s -> 31.8 s and 10.7 s -> 8.6 s. Times are the wall clock of
 the whole CLI process; memory is the peak summed RSS of the process tree. Each cell is the median of the runs given
 in brackets. Every one of the 24 runs returned the identical score (invsqrt 100,568.4992; DQI 377,372,994,802.87;
 chemistry 317,777,218.02).
 
 | task | kickmix 1.0.0, 1 worker | engine, 1 thread | speed-up | kickmix 1.0.0, 4 workers | engine, 4 threads | speed-up | peak memory, official / engine (4) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| invsqrt `bce2948ff24e` | 686.0 s (1) | 179.9 s (2) | 3.8x | 173.7 s (2) | 53.1 s (3) | 3.3x | 464-481 / 471-497 MiB |
-| DQI `e3928244a1c1` | 219.9 s (1) | 41.9 s (2) | 5.2x | 83.5 s (2) | 12.8 s (2; first run 14.1 s) | 6.5x | 5,099-5,282 / 429 MiB |
+| invsqrt `bce2948ff24e` | 686.0 s (1) | **79.1 s** (3) | **8.7x** | 173.7 s (2) | **23.3 s** (3) | **7.5x** | 464-481 / 515 MiB |
+| DQI `e3928244a1c1` | 219.9 s (1) | **31.8 s** (3) | **6.9x** | 83.5 s (2) | **8.6 s** (3) | **9.7x** | 5,099-5,282 / 459 MiB |
 | chemistry HW-13 | 14.8 s (3; first run 35.0 s) | 2.7 s (2) | 5.5x | (single process) 14.8 s | 1.6 s (2; first run after a cache clear 8.0 s) | 9.3x | 849-852 / 645-937 MiB |
 
 Caveats. This is one machine, and it was **not idle**. Other agents' work, including a 4-core `qrom-plan` job, ran
 throughout, and the 1-minute load average was 6.0-9.2 during the engine runs and 3.4-9.1 during the official runs.
 Each run's load is recorded in its JSON. The official invsqrt rows ran at lower load (3.4-5.1) than the engine
 invsqrt rows (6.4-9.2), so the invsqrt ratios lean conservative for the engine. The rows were not alternated, and the 1-worker
-official invsqrt and DQI rows are single runs. invsqrt gains least because its per-shot checks (x restored, scratch
-clean, phase tolerance per x) still run in NumPy; porting them to Rust is open. The older tables below remain the
+official invsqrt and DQI rows are single runs. The per-shot invsqrt checks now run on the engine; they were about 1% of the time, and the gain came from
+the simulator (uniform runs, lockstep pairs). The older tables below remain the
 reference for their circuits and dates. Evidence: VQCC project card
 `experiments/2026-11-03-engine-general-paired-runner.md`, `outputs/engine-paired-runner-2026-11-03/benchmarks/`.
 
