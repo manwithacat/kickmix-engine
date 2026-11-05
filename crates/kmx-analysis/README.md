@@ -1,4 +1,4 @@
-# kmx-analysis (P1: streaming liveness / peak pass)
+# kmx-analysis (P1: streaming liveness / peak pass; P2: GF(2) echelon objects)
 
 Static analysis over kickmix `.kmb` circuits, separate from the verify wheel. Engineering card E1
 (`experiments/2026-11-05-engine-streaming-liveness.md` in the competition repo). The Python reference is
@@ -24,3 +24,24 @@ cp target/release/lib_kmx_analysis.dylib python/kickmix_analysis/_kmx_analysis.a
 
 Parity drivers: `parity/parity.py` (pinned circuits: intervals, profiles, `qhdl peak` JSON, allocator output) and
 `parity/random_parity.py` (synthetic circuits with nested condition blocks and `_IF` resets).
+
+## P2: GF(2) echelon objects (card E2, 2026-11-05)
+
+`src/gf2.rs` (pure Rust, runtime widths; generalised from the engine's `crates/qrom-plan/src/gf2.rs`) and
+`py/src/gf2_py.rs` (binding). Reference: `tools/dfthc-refit/recover.py` (`Basis`, `rank`, `nullspace`) and
+`planner_shared.intersect` / `decompose` in the competition repository. Pivot = highest set bit of the partially
+reduced vector, rows not mutually reduced, combination masks over the independent added vectors: every reduced
+vector and mask equals the Python one, so the planners' random paths and plans are byte-identical.
+
+- `Gf2Basis(width)`: `add`, `add_many`, `reduce`, `solve`, `solve_many`, `contains`, `decompose`, `truncate`,
+  `vectors`, `len` (vectors are Python ints below `2**width`; wider ints raise OverflowError).
+- `GroupSet(nb, width, groups)`: `nb` bases plus a table of groups `[(basis, vector), ...]` (a pair line's two
+  ends) kept in Rust, so a pairing pass is a few calls: `build`, `build_values` (no masks), `independent`,
+  `add_group`, `greedy`, `first_pair`, `positions`, `compute_status` + `enabled` (the rebuild exchange test),
+  `compute_decomp` + `quotient_cands` + `quotient_pair` (`augment_quotient`), `add_vec`, `size`.
+- `gf2_rank(rows)`, `gf2_nullspace(rows, width)`, `gf2_intersect(V1, V2, m)`.
+
+Callers switch with `backend="rust"` (default `"python"`) in `tools/dfthc-refit` (`recover.make_basis/rank/
+nullspace/structure`, `planner_shared.SharedPlanner/plan/intersect`, `planner_block.plan_generic`,
+`price_words.gf2_rank`), or `DFTHC_GF2_BACKEND=rust` for the module default. Parity driver:
+`parity/gf2_property.py REF_DFTHC_REFIT_DIR OUT.json` (randomized, against an unpatched copy).

@@ -46,3 +46,55 @@ def idle_gaps(path, run_s, run_e, *, register_gaps=False, cond_rule=False):
 def recolour(path, logical, col, *, cond_rule=False):
     return _k.recolour(str(path), np.ascontiguousarray(logical, np.int64), np.ascontiguousarray(col, np.int64),
                        bool(cond_rule))
+
+
+# ------------------------------------------------------------------ GF(2) echelon objects (card E2, P2 primitive)
+# Reference: tools/dfthc-refit/recover.py (Basis, rank, nullspace) and planner_shared.intersect / decompose in the
+# competition repository. Same pivots (highest bit), same reduced vectors, same combination masks.
+#
+#   Gf2Basis(width)            add(v) -> bool, add_many(vs), reduce(v) -> (v, c), solve(v) -> c | None,
+#                              solve_many(vs), contains(v), decompose(v) -> (residual, c), truncate(n), vectors, len
+#   GroupSet(nb, width, groups) nb bases + a table of groups [(basis, v), ...]; build(sel), independent(g),
+#                              add_group(g), greedy(order), first_pair(ids), positions(g), compute_status(ids),
+#                              enabled(bx, px, by, py), compute_decomp(ids), quotient_cands(...), quotient_pair(c, cap),
+#                              add_vec(b, v), size(b), sizes(), restore(sizes)
+#   gf2_rank(rows), gf2_nullspace(rows, width), gf2_intersect(V1, V2, m)
+
+Gf2Basis = _k.Gf2Basis
+GroupSet = _k.GroupSet
+
+
+def _bits(rows):
+    return max((int(v).bit_length() for v in rows), default=0)
+
+
+def gf2_rank(rows, width=None):
+    """Rank of integer bit-rows; `width` is a hint (rows wider than it are measured)."""
+    rows = list(rows)
+    if width:
+        try:
+            return _k.gf2_rank(rows, int(width))
+        except (OverflowError, TypeError):
+            pass
+    rows = [int(v) for v in rows]
+    return _k.gf2_rank(rows, max(_bits(rows), 1))
+
+
+def gf2_nullspace(rows, width):
+    """recover.nullspace(rows, width)."""
+    rows = list(rows)
+    try:
+        return _k.gf2_nullspace(rows, int(width), max(int(width), 1))
+    except (OverflowError, TypeError):
+        rows = [int(v) for v in rows]
+        return _k.gf2_nullspace(rows, int(width), max(_bits(rows), 1))
+
+
+def gf2_intersect(V1, V2, m):
+    """planner_shared.intersect(V1, V2, m)."""
+    try:
+        return _k.gf2_intersect(V1, V2, int(m), max(int(m), 1))
+    except (OverflowError, TypeError):
+        V1 = [int(v) for v in V1]
+        V2 = [int(v) for v in V2]
+        return _k.gf2_intersect(V1, V2, int(m), max(_bits(V1), _bits(V2), 1))
