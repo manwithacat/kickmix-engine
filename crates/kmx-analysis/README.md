@@ -45,3 +45,21 @@ Callers switch with `backend="rust"` (default `"python"`) in `tools/dfthc-refit`
 nullspace/structure`, `planner_shared.SharedPlanner/plan/intersect`, `planner_block.plan_generic`,
 `price_words.gf2_rank`), or `DFTHC_GF2_BACKEND=rust` for the module default. Parity driver:
 `parity/gf2_property.py REF_DFTHC_REFIT_DIR OUT.json` (randomized, against an unpatched copy).
+
+## P3: tapped value simulator (card E3, 2026-11-05)
+
+`src/valuesim.rs` (with `src/mt.rs`, CPython's Mersenne Twister, and `src/blake2b.rs`, unkeyed BLAKE2b) and
+`py/src/valuesim_py.rs`. Reference: the bit-parallel value loop of `scripts/qhdl_simulate.py` (`simulate`) and its
+copies in `scripts/dqi_l27c_andprints.py`, `dqi_l27c_blocks.py`, `dqi_l29c_rare.py` and `xpath_l33_dqi.py`. Values
+only (phases ignored); one lane per shot; HMR outcomes are `random.Random(seed).getrandbits(L)` per HMR, drawn on
+every HMR whatever the mask, exactly as the Python; `outcomes='zero'` and `'explicit'` give RNG-free runs.
+
+- `value_sim(path, wires, cbits, lanes, *, seed, outcomes, points, windows, dep_cuts, prints, rare_cap, tflag,
+  stop, threads)`: taps before the op at their index (index `num_ops` = end state): point snapshots of wire lists,
+  window deltas (start ^ end per wire, nonzero only), GF(2) dependence of all wires plus the all-ones row at cuts
+  (worker threads), and per Toffoli-like op the product lane count, fingerprints (`blake2b-64 >> 1`, canonical
+  over complement), the andprints flags, rare-lane lists and the blocks target flags.
+- `pack_lanes`, `words_to_int`, `mt_getrandbits`, `gf2_dependent` helpers.
+
+The scripts gain `--backend python|rust` (default python); `qhdl_simulate.rust_module()` / `rust_state()` are shared.
+Parity drivers live with the card's evidence (`outputs/engine-tapped-value-simulator-2026-11-05/drivers/`).

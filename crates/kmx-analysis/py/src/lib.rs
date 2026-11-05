@@ -1,5 +1,6 @@
 //! Python binding for kmx-analysis: extension `kickmix_analysis._kmx_analysis`.
 mod gf2_py;
+mod valuesim_py;
 use kmx_analysis::liveness as L;
 use numpy::{PyArray1, PyReadonlyArray1};
 use pyo3::exceptions::PyValueError;
@@ -141,5 +142,6 @@ fn _kmx_analysis(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(idle_gaps, m)?)?;
     m.add_function(wrap_pyfunction!(recolour, m)?)?;
     gf2_py::register(m)?;
+    valuesim_py::register(m)?;
     Ok(())
 }

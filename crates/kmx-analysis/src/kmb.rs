@@ -26,6 +26,12 @@ pub struct Header {
     pub registers: Vec<(String, Vec<(bool, u32)>)>,
     /// payload offsets: op types, qqq0, qqq1, qqq2, qq0, qq1, q0
     pub offs: [u64; 7],
+    /// classical-bit operand stream (b0, one entry per op with bit 0x40) and condition stream (bc, one entry per op
+    /// with bit 0x80): counts and payload offsets (added for the value simulator, card E3)
+    pub n_b: u64,
+    pub n_c: u64,
+    pub off_b: u64,
+    pub off_c: u64,
 }
 
 impl Header {
@@ -114,6 +120,7 @@ pub fn read_header(path: &str) -> Result<Header, String> {
     ];
     let mut hf = File::open(path).map_err(|e| err(path, e))?;
     let mut offs = [0u64; 7];
+    let (mut off_b, mut off_c) = (0u64, 0u64);
     let mut p = pos;
     for (i, &(ty, sz)) in sizes.iter().enumerate() {
         if p + 16 > file_len {
@@ -130,6 +137,10 @@ pub fn read_header(path: &str) -> Result<Header, String> {
         }
         if i < 7 {
             offs[i] = p + 16;
+        } else if i == 7 {
+            off_b = p + 16;
+        } else if i == 8 {
+            off_c = p + 16;
         }
         p += 16 + sz;
     }
@@ -148,11 +159,11 @@ pub fn read_header(path: &str) -> Result<Header, String> {
     if p + 16 + size != file_len {
         return Err(bad("trailing bytes"));
     }
-    Ok(Header { num_qubits, num_bits, num_ops, n_qqq, n_qq, n_q, registers, offs })
+    Ok(Header { num_qubits, num_bits, num_ops, n_qqq, n_qq, n_q, registers, offs, n_b, n_c, off_b, off_c })
 }
 
 /// Chunked sequential reader of one little-endian u32 (or u8) packet.
-struct Chunked {
+pub(crate) struct Chunked {
     f: File,
     left_bytes: u64,
     buf: Vec<u8>,
@@ -161,7 +172,7 @@ struct Chunked {
 }
 
 impl Chunked {
-    fn open(path: &str, off: u64, nbytes: u64, cap: usize) -> Result<Self, String> {
+    pub(crate) fn open(path: &str, off: u64, nbytes: u64, cap: usize) -> Result<Self, String> {
         let mut f = File::open(path).map_err(|e| err(path, e))?;
         f.seek(SeekFrom::Start(off)).map_err(|e| err(path, e))?;
         Ok(Chunked { f, left_bytes: nbytes, buf: vec![0u8; cap], pos: 0, len: 0 })
@@ -179,7 +190,7 @@ impl Chunked {
         Ok(())
     }
     #[inline]
-    fn u8(&mut self) -> Result<u8, String> {
+    pub(crate) fn u8(&mut self) -> Result<u8, String> {
         if self.pos == self.len {
             self.refill()?;
         }
@@ -188,7 +199,7 @@ impl Chunked {
         Ok(v)
     }
     #[inline]
-    fn u32(&mut self) -> Result<u32, String> {
+    pub(crate) fn u32(&mut self) -> Result<u32, String> {
         if self.pos == self.len {
             self.refill()?; // chunk sizes are multiples of 4
         }
@@ -196,7 +207,7 @@ impl Chunked {
         self.pos += 4;
         Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
     }
-    fn exhausted(&self) -> bool {
+    pub(crate) fn exhausted(&self) -> bool {
         self.left_bytes == 0 && self.pos == self.len
     }
 }
@@ -252,4 +263,85 @@ pub fn for_each_op<F: FnMut(u64, u8, &[u32], usize)>(path: &str, mut f: F) -> Re
         return Err(format!("{}: operand counts do not match the op-type stream", path));
     }
     Ok(h)
+}
+
+/// Read-only memory map of a whole file (card E3: lane slices of the value simulator share the page-cache pages
+/// instead of each copying the streams through `read`). Declared against the C library std already links; the
+/// PROT_READ / MAP_PRIVATE values are the same on macOS and Linux.
+pub(crate) struct Mapped {
+    ptr: *mut u8,
+    len: usize,
+}
+unsafe impl Send for Mapped {}
+unsafe impl Sync for Mapped {}
+
+extern "C" {
+    fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
+    fn munmap(addr: *mut u8, len: usize) -> i32;
+}
+
+impl Mapped {
+    pub(crate) fn open(path: &str) -> Result<Self, String> {
+        use std::os::fd::AsRawFd;
+        let f = File::open(path).map_err(|e| err(path, e))?;
+        let len = f.metadata().map_err(|e| err(path, e))?.len() as usize;
+        if len == 0 {
+            return Err(format!("{}: empty file", path));
+        }
+        const PROT_READ: i32 = 1;
+        const MAP_PRIVATE: i32 = 2;
+        let p = unsafe { mmap(std::ptr::null_mut(), len, PROT_READ, MAP_PRIVATE, f.as_raw_fd(), 0) };
+        if p.is_null() || p as isize == -1 {
+            return Err(format!("{}: mmap failed", path));
+        }
+        Ok(Mapped { ptr: p, len })
+    }
+    pub(crate) fn bytes(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+}
+impl Drop for Mapped {
+    fn drop(&mut self) {
+        unsafe {
+            munmap(self.ptr, self.len);
+        }
+    }
+}
+
+/// Sequential cursor over one packet of a mapped file.
+pub(crate) struct Cur<'a> {
+    d: &'a [u8],
+    p: usize,
+}
+impl<'a> Cur<'a> {
+    pub(crate) fn new(m: &'a Mapped, off: u64, nbytes: u64) -> Result<Self, String> {
+        let (o, n) = (off as usize, nbytes as usize);
+        if o + n > m.len {
+            return Err("stream outside the file".into());
+        }
+        Ok(Cur { d: &m.bytes()[o..o + n], p: 0 })
+    }
+    #[inline(always)]
+    pub(crate) fn u8(&mut self) -> Result<u8, String> {
+        match self.d.get(self.p) {
+            Some(&v) => {
+                self.p += 1;
+                Ok(v)
+            }
+            None => Err("stream exhausted".into()),
+        }
+    }
+    #[inline(always)]
+    pub(crate) fn u32(&mut self) -> Result<u32, String> {
+        match self.d.get(self.p..self.p + 4) {
+            Some(b) => {
+                self.p += 4;
+                Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            }
+            None => Err("stream exhausted".into()),
+        }
+    }
+    pub(crate) fn exhausted(&self) -> bool {
+        self.p == self.d.len()
+    }
 }
