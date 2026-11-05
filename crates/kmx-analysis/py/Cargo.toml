@@ -1,0 +1,17 @@
+[package]
+name = "kmx-analysis-py"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "PyO3 binding: Python extension module kickmix_analysis._kmx_analysis"
+
+[lib]
+name = "_kmx_analysis"
+crate-type = ["cdylib"]
+test = false
+doctest = false
+
+[dependencies]
+kmx-analysis = { path = ".." }
+pyo3 = { version = "0.26", features = ["abi3-py312", "extension-module"] }
+numpy = "0.26"

@@ -1,0 +1,23 @@
+[package]
+name = "kmx-analysis"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Static analysis primitives over kickmix .kmb circuits (streaming liveness / peak pass). Not part of the verify wheel."
+
+[lib]
+name = "kmx_analysis"
+path = "src/lib.rs"
+
+[dependencies]
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+debug = false
+
+# Own workspace on purpose: the engine's root Cargo.toml / Cargo.lock (verify wheel) stay byte-identical.
+# The PyO3 binding crate lives below this root so it can be a member.
+[workspace]
+members = [".", "py"]
